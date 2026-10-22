@@ -36,6 +36,13 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Fast start, then overshoots a little before settling (a small bounce); 0 → 0, 1 → 1.
+pub fn ease_out_back(t: f32) -> f32 {
+    const C1: f32 = 1.70158;
+    let t = t.clamp(0.0, 1.0) - 1.0;
+    1.0 + (C1 + 1.0) * t.powi(3) + C1 * t.powi(2)
+}
+
 /// Linear blend of two RGB colours; non-RGB colours are returned unchanged (`a`).
 pub fn lerp(a: Color, b: Color, t: f32) -> Color {
     let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (a, b) else {
@@ -151,6 +158,13 @@ mod tests {
         assert_eq!(buf, Buffer::with_lines(["abcd", "efgh"]));
         sweep(&mut buf, area, 0.0);
         assert_eq!(buf, Buffer::with_lines(["    ", "    "]));
+    }
+
+    #[test]
+    fn bounce_easing_starts_at_0_and_ends_at_1() {
+        assert!(ease_out_back(0.0).abs() < 1e-6);
+        assert!((ease_out_back(1.0) - 1.0).abs() < 1e-6);
+        assert!(ease_out_back(0.7) > 1.0, "overshoots before settling");
     }
 
     #[test]

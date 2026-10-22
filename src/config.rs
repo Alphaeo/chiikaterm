@@ -1,0 +1,129 @@
+//! Files chiika keeps: the user config (agents) and the per-project canvas (teams).
+
+use std::path::{Path, PathBuf};
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+/// What the user answered when chiika offered to connect an agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentChoice {
+    Connected,
+    Declined,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agents {
+    /// `None` until the user has been asked.
+    pub claude: Option<AgentChoice>,
+}
+
+/// `config.toml` in the user's config directory.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub agents: Agents,
+}
+
+/// One team box of the canvas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamEntry {
+    pub id: u32,
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// `.chiika/canvas.toml` in the project.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasFile {
+    #[serde(default, rename = "team")]
+    pub teams: Vec<TeamEntry>,
+}
+
+/// Reads a TOML file; a missing file gives the default, an invalid one too (logged).
+pub fn load<T: Default + DeserializeOwned>(path: &Path) -> T {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return T::default();
+    };
+    toml::from_str(&text).unwrap_or_else(|e| {
+        tracing::warn!("ignoring invalid {}: {e}", path.display());
+        T::default()
+    })
+}
+
+pub fn save<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, toml::to_string(value)?)?;
+    Ok(())
+}
+
+/// `%APPDATA%\chiika\config.toml` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere.
+pub fn config_path() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    };
+    Some(base?.join("chiika").join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_file(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("chiika-test-{}", std::process::id()))
+            .join(name)
+    }
+
+    #[test]
+    fn config_round_trips() {
+        let path = temp_file("config.toml");
+        let config = Config {
+            agents: Agents {
+                claude: Some(AgentChoice::Connected),
+            },
+        };
+        save(&path, &config).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("claude = \"connected\"")
+        );
+        assert_eq!(load::<Config>(&path), config);
+    }
+
+    #[test]
+    fn canvas_round_trips() {
+        let path = temp_file("canvas.toml");
+        let canvas = CanvasFile {
+            teams: vec![TeamEntry {
+                id: 3,
+                name: "backend".into(),
+                x: 2,
+                y: -1,
+                collapsed: true,
+            }],
+        };
+        save(&path, &canvas).unwrap();
+        assert_eq!(load::<CanvasFile>(&path), canvas);
+    }
+
+    #[test]
+    fn missing_or_invalid_files_give_defaults() {
+        assert_eq!(load::<Config>(&temp_file("absent.toml")), Config::default());
+        let path = temp_file("broken.toml");
+        save(&path, &CanvasFile::default()).unwrap();
+        std::fs::write(&path, "team = [[[").unwrap();
+        assert_eq!(load::<CanvasFile>(&path), CanvasFile::default());
+    }
+}

@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::agent::{AgentInfo, AgentState};
 use crate::app::AppEvent;
+use crate::shell::{Finished, ShellMarks};
 
 /// Seconds of output history kept for the activity sparkline.
 pub const ACTIVITY_SECS: usize = 8;
@@ -25,15 +27,19 @@ pub enum Status {
 pub struct Session {
     pub id: u32,
     pub name: String,
-    pub parser: Arc<Mutex<vt100::Parser>>,
+    pub parser: Arc<Mutex<vt100::Parser<ShellMarks>>>,
     pub status: Status,
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     pub started: Instant,
     pub activity: Activity,
-    /// Sidebar folder holding this session.
+    /// Sidebar folder (= canvas team) holding this session.
     pub folder: Option<u32>,
+    /// A helper (the instructions editor): closed as soon as its program exits.
+    pub ephemeral: bool,
+    /// Set when this session runs a Claude Code agent.
+    pub agent: Option<AgentInfo>,
     last_output: Option<Instant>,
 }
 
@@ -92,7 +98,9 @@ impl Session {
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
+        let parser =
+            vt100::Parser::new_with_callbacks(size.rows, size.cols, 1000, ShellMarks::default());
+        let parser = Arc::new(Mutex::new(parser));
 
         let thread_parser = Arc::clone(&parser);
         let thread_writer = Arc::clone(&writer);
@@ -140,6 +148,8 @@ impl Session {
             started: Instant::now(),
             activity: Activity::default(),
             folder: None,
+            ephemeral: false,
+            agent: None,
             last_output: None,
         })
     }
@@ -154,11 +164,44 @@ impl Session {
         self.activity.advance(self.second(now));
     }
 
+    /// A command is running (shell integration), else output arrived just now.
     pub fn is_busy(&self, now: Instant) -> bool {
+        if self.status != Status::Running {
+            return false;
+        }
+        if let Some(agent) = &self.agent {
+            return agent.state == AgentState::Working;
+        }
+        let parser = self.parser.lock().unwrap();
+        let marks = parser.callbacks();
+        if marks.integrated {
+            return marks.running.is_some();
+        }
+        self.last_output
+            .is_some_and(|t| now.saturating_duration_since(t) < BUSY_FOR)
+    }
+
+    /// An agent waiting for an answer of the user.
+    pub fn needs_user(&self, now: Instant) -> bool {
         self.status == Status::Running
             && self
-                .last_output
-                .is_some_and(|t| now.saturating_duration_since(t) < BUSY_FOR)
+                .agent
+                .as_ref()
+                .is_some_and(|a| a.shown_state(now) == AgentState::Waiting)
+    }
+
+    pub fn last_output(&self) -> Option<Instant> {
+        self.last_output
+    }
+
+    /// Runs `f` on what the shell integration knows.
+    pub fn marks<T>(&self, f: impl FnOnce(&ShellMarks) -> T) -> T {
+        f(self.parser.lock().unwrap().callbacks())
+    }
+
+    /// Commands finished since the last call.
+    pub fn take_finished(&self) -> Vec<Finished> {
+        self.parser.lock().unwrap().callbacks_mut().take_finished()
     }
 
     fn second(&self, now: Instant) -> u64 {
@@ -306,5 +349,38 @@ mod tests {
         activity.advance(5);
         activity.record(3, 4);
         assert_eq!(activity.values(), [0, 0, 0, 0, 0, 0, 0, 4]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_integration_reports_commands_and_cwd() {
+        let mut cmd = CommandBuilder::new("powershell.exe");
+        let script = crate::shell::encoded_command();
+        cmd.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NoExit",
+            "-EncodedCommand",
+            &script,
+        ]);
+        let (mut session, _rx) = spawn(cmd);
+        let wait = |session: &Session, what: &str, done: &dyn Fn(&ShellMarks) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !session.marks(done) {
+                assert!(Instant::now() < deadline, "timeout waiting for {what}");
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+        wait(&session, "first prompt", &|m| {
+            m.integrated && m.cwd.is_some()
+        });
+        session.write(b"cmd /c exit 3\r").unwrap();
+        wait(&session, "command end", &|m| m.last.is_some());
+        let last = session.marks(|m| m.last.clone()).unwrap();
+        assert_eq!(last.text, "cmd /c exit 3");
+        assert_eq!(last.code, 3);
+        assert_eq!(session.take_finished().len(), 1);
+        assert!(!session.is_busy(Instant::now()));
+        session.kill();
     }
 }

@@ -1,8 +1,14 @@
+mod agent;
 mod app;
+mod canvas;
+mod channel;
+mod config;
 mod fx;
 mod keys;
 mod layout;
+mod mascot;
 mod session;
+mod shell;
 mod theme;
 mod ui;
 
@@ -23,7 +29,7 @@ use ratatui::layout::Rect;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
-use crate::app::{App, AppEvent};
+use crate::app::{App, AppEvent, Paths};
 
 /// `--help` text, built from the same table as the in-app bindings window.
 fn usage() -> String {
@@ -45,6 +51,11 @@ fn main() -> anyhow::Result<()> {
         [] => {}
         [a] if a == "--version" || a == "-V" => {
             println!("chiika {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // Run by the agents' Claude Code hooks: forward the hook to the chiika that started them.
+        [a] if a == "hook" => {
+            run_hook();
             return Ok(());
         }
         [a] if a == "--help" || a == "-h" => {
@@ -85,6 +96,28 @@ fn main() -> anyhow::Result<()> {
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
+}
+
+/// Sends the hook JSON read on stdin to the chiika channel. Silent and always successful: an
+/// agent must never be blocked or disturbed because chiika is gone.
+fn run_hook() {
+    use std::io::Read;
+    let var = |name: &str| std::env::var(name).ok();
+    let (Some(port), Some(token), Some(session)) = (
+        var("CHIIKA_PORT").and_then(|p| p.parse().ok()),
+        var("CHIIKA_TOKEN"),
+        var("CHIIKA_SESSION"),
+    ) else {
+        return;
+    };
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .take(256 * 1024)
+        .read_to_end(&mut input)
+        .is_ok()
+    {
+        let _ = channel::send(port, &token, &session, &input);
+    }
 }
 
 /// Logs go to the file named by `CHIIKA_LOG` only: stdout belongs to the TUI.
@@ -128,7 +161,12 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         .context("spawning input thread")?;
 
     let size = terminal.size()?;
-    let mut app = App::new(Rect::new(0, 0, size.width, size.height), tx);
+    let paths = Paths {
+        config: config::config_path(),
+        project: std::env::current_dir().ok().map(|dir| dir.join(".chiika")),
+        exe: std::env::current_exe().ok(),
+    };
+    let mut app = App::new(Rect::new(0, 0, size.width, size.height), tx, paths);
     while !app.should_quit {
         let now = Instant::now();
         app.tick(now);

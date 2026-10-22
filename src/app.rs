@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,11 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use crate::fx::fuzzy_match;
+use crate::agent::{self, AgentInfo, AgentState};
+use crate::canvas::{self, CanvasState};
+use crate::channel::{self, Channel, HookEvent};
+use crate::config::{self, AgentChoice, CanvasFile, Config, TeamEntry};
+use crate::fx::{format_duration, fuzzy_match};
 use crate::keys::{encode_key, encode_paste};
 use crate::layout::{Dir, Layout, Split};
 use crate::session::{Session, Status};
@@ -26,6 +31,12 @@ const MAX_INPUT_LEN: usize = 20;
 /// Two clicks on the same card within this delay = double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// An agent exiting this soon after its start failed to launch.
+const AGENT_EARLY_EXIT: Duration = Duration::from_secs(15);
+
+/// How often team instructions are re-read from disk.
+const CONSIGNE_RELOAD: Duration = Duration::from_secs(2);
+
 /// Duration of the panel wipe when switching sessions.
 pub const SWITCH_ANIM: Duration = Duration::from_millis(200);
 pub const TOAST_LIFE: Duration = Duration::from_secs(4);
@@ -33,11 +44,19 @@ pub const TOAST_SLIDE: Duration = Duration::from_millis(150);
 pub const TOAST_FADE: Duration = Duration::from_millis(500);
 const MAX_TOASTS: usize = 3;
 
+/// Commands at least this long get a notification (when not focused) and a mascot reaction.
+const NOTABLE_COMMAND: Duration = Duration::from_secs(2);
+
+/// How long the mascot keeps reacting to a command result (for the frame clock).
+const REACTION: Duration = Duration::from_secs(5);
+
 pub enum AppEvent {
     Input(Event),
     /// Session id and number of bytes read.
     PtyOutput(u32, usize),
     PtyClosed(u32),
+    /// A Claude Code hook of the agent in this session, received by the chiika channel.
+    Hook(u32, crate::channel::HookEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +68,37 @@ pub enum Mode {
     Menu,
     /// The list of key bindings.
     Help,
+    /// First launch: offer to connect Claude Code.
+    Onboarding,
+}
+
+/// What the main area shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Terminals,
+    Canvas,
+}
+
+/// Where chiika keeps its files; `None` keeps nothing (tests).
+#[derive(Debug, Clone, Default)]
+pub struct Paths {
+    /// The user config file.
+    pub config: Option<PathBuf>,
+    /// The project's `.chiika` directory.
+    pub project: Option<PathBuf>,
+    /// The chiika executable, run by the agents' hooks.
+    pub exe: Option<PathBuf>,
+}
+
+impl Paths {
+    fn canvas_file(&self) -> Option<PathBuf> {
+        Some(self.project.as_ref()?.join("canvas.toml"))
+    }
+
+    fn team_file(&self, id: u32) -> Option<PathBuf> {
+        let teams = self.project.as_ref()?.join("teams");
+        Some(teams.join(format!("team-{id}")).join("TEAM.md"))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +117,8 @@ pub enum Action {
     ClosePane,
     FocusPane(Dir),
     ToggleSidebar,
+    ToggleView,
+    NewTeam,
     Help,
     Next,
     Prev,
@@ -93,10 +145,15 @@ pub enum Target {
     Session(u32),
 }
 
+/// A sidebar folder, which is also a team box of the canvas.
 pub struct Folder {
     pub id: u32,
     pub name: String,
     pub collapsed: bool,
+    /// Canvas position of the team box.
+    pub pos: (i32, i32),
+    /// First meaningful line of the team's `TEAM.md`.
+    pub consigne: Option<String>,
 }
 
 /// What a palette entry does.
@@ -110,6 +167,7 @@ pub enum Command {
     Split(Split),
     ClosePane,
     ToggleSidebar,
+    ToggleView,
     Theme(usize),
     Quit,
 }
@@ -139,6 +197,14 @@ pub enum MenuAction {
     Detach,
     SetTheme(usize),
     ToggleSidebar,
+    EditConsigne(u32),
+    /// New team at this canvas position.
+    NewTeamAt(i32, i32),
+    ToggleClaude,
+    /// Opens the role menu to add an agent to this team.
+    AgentRoles(u32),
+    /// Team, index in `agent::ROLES`.
+    AddAgent(u32, usize),
 }
 
 impl MenuAction {
@@ -173,11 +239,14 @@ pub struct Toast {
 }
 
 /// Where a new session is shown.
+#[derive(Clone, Copy)]
 enum Place {
     /// In the focused pane, instead of what it showed.
     Replace,
     /// In a new pane cut from the focused one.
     Split(Split),
+    /// Nowhere yet (an agent lives in its team box until opened).
+    Hidden,
 }
 
 /// A shell that can be started in a session.
@@ -186,6 +255,8 @@ pub struct ShellSpec {
     /// `None` = the user's default shell (`$SHELL`).
     prog: Option<&'static str>,
     args: &'static [&'static str],
+    /// PowerShell: load chiika's shell integration (see `shell.rs`).
+    integrated: bool,
 }
 
 /// Known shells; `n` starts the first one that spawns, the palette offers each of them.
@@ -195,21 +266,25 @@ const SHELLS: &[ShellSpec] = &[
         label: "pwsh",
         prog: Some("pwsh.exe"),
         args: &["-NoLogo"],
+        integrated: true,
     },
     ShellSpec {
         label: "powershell",
         prog: Some("powershell.exe"),
         args: &["-NoLogo"],
+        integrated: true,
     },
     ShellSpec {
         label: "cmd",
         prog: Some("cmd.exe"),
         args: &[],
+        integrated: false,
     },
     ShellSpec {
         label: "wsl",
         prog: Some("wsl.exe"),
         args: &[],
+        integrated: false,
     },
 ];
 #[cfg(not(windows))]
@@ -218,21 +293,25 @@ const SHELLS: &[ShellSpec] = &[
         label: "shell",
         prog: None,
         args: &[],
+        integrated: false,
     },
     ShellSpec {
         label: "bash",
         prog: Some("bash"),
         args: &[],
+        integrated: false,
     },
     ShellSpec {
         label: "zsh",
         prog: Some("zsh"),
         args: &[],
+        integrated: false,
     },
     ShellSpec {
         label: "fish",
         prog: Some("fish"),
         args: &[],
+        integrated: false,
     },
 ];
 
@@ -261,6 +340,15 @@ pub struct App {
     pub switched_at: Option<Instant>,
     /// Reference for animations that loop (spinners).
     pub epoch: Instant,
+    /// When the last notable command ended and whether it succeeded (drives the mascot).
+    pub last_result: Option<(Instant, bool)>,
+    pub view: View,
+    pub canvas: CanvasState,
+    pub config: Config,
+    paths: Paths,
+    consigne_checked: Instant,
+    /// Where the agents' hooks report; `None` if it could not start.
+    channel: Option<Channel>,
     rename: Option<Target>,
     next_folder: u32,
     last_click: Option<(Instant, usize)>,
@@ -271,7 +359,8 @@ pub struct App {
 
 impl App {
     /// `area` is the full terminal area; the first shell is started at the panel size.
-    pub fn new(area: Rect, tx: Sender<AppEvent>) -> App {
+    /// Teams and settings are read from (and saved to) `paths`.
+    pub fn new(area: Rect, tx: Sender<AppEvent>, paths: Paths) -> App {
         let mut app = App {
             sessions: Vec::new(),
             folders: Vec::new(),
@@ -289,6 +378,17 @@ impl App {
             toasts: Vec::new(),
             switched_at: None,
             epoch: Instant::now(),
+            last_result: None,
+            view: View::Terminals,
+            canvas: CanvasState::default(),
+            config: paths
+                .config
+                .as_deref()
+                .map(config::load)
+                .unwrap_or_default(),
+            paths,
+            consigne_checked: Instant::now(),
+            channel: None,
             rename: None,
             next_folder: 1,
             last_click: None,
@@ -301,7 +401,130 @@ impl App {
         if !app.sessions.is_empty() {
             app.mode = Mode::Terminal;
         }
+        // Teams are loaded after the first shell so that it does not land in one.
+        app.load_teams();
+        if let Some(id) = app.focused {
+            app.focus(id);
+        }
+        app.channel = channel::start(app.tx.clone())
+            .inspect_err(|e| tracing::warn!("chiika channel unavailable: {e}"))
+            .ok();
+        let ask_claude = app.config.agents.claude.is_none() && claude_installed();
+        if app.paths.config.is_some() && ask_claude {
+            app.mode = Mode::Onboarding;
+            app.picked = 0;
+        }
         app
+    }
+
+    fn load_teams(&mut self) {
+        let file: CanvasFile = self
+            .paths
+            .canvas_file()
+            .as_deref()
+            .map(config::load)
+            .unwrap_or_default();
+        self.folders = file
+            .teams
+            .into_iter()
+            .map(|t| Folder {
+                id: t.id,
+                name: t.name,
+                collapsed: t.collapsed,
+                pos: (t.x, t.y),
+                consigne: None,
+            })
+            .collect();
+        self.next_folder = self.folders.iter().map(|f| f.id + 1).max().unwrap_or(1);
+        self.reload_consignes();
+    }
+
+    pub(crate) fn save_canvas(&mut self) {
+        let Some(path) = self.paths.canvas_file() else {
+            return;
+        };
+        let file = CanvasFile {
+            teams: self
+                .folders
+                .iter()
+                .map(|f| TeamEntry {
+                    id: f.id,
+                    name: f.name.clone(),
+                    x: f.pos.0,
+                    y: f.pos.1,
+                    collapsed: f.collapsed,
+                })
+                .collect(),
+        };
+        if let Err(e) = config::save(&path, &file) {
+            self.status_msg = Some(format!("cannot save the teams: {e:#}"));
+        }
+    }
+
+    fn reload_consignes(&mut self) {
+        for folder in &mut self.folders {
+            folder.consigne = self
+                .paths
+                .team_file(folder.id)
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|text| consigne_excerpt(&text));
+        }
+    }
+
+    fn set_claude(&mut self, choice: AgentChoice) {
+        self.config.agents.claude = Some(choice);
+        if let Some(path) = &self.paths.config
+            && let Err(e) = config::save(path, &self.config)
+        {
+            self.status_msg = Some(format!("cannot save the settings: {e:#}"));
+        }
+    }
+
+    pub(crate) fn set_view(&mut self, view: View) {
+        self.view = view;
+        self.canvas.grab = None;
+        if view == View::Canvas && self.mode == Mode::Terminal {
+            self.mode = Mode::Workspace;
+        }
+    }
+
+    /// Opens the team's `TEAM.md` (created from a template) in an editor pane.
+    fn edit_consigne(&mut self, id: u32) {
+        let Some(path) = self.paths.team_file(id) else {
+            self.status_msg = Some("no project folder to keep the instructions in".into());
+            return;
+        };
+        let team = self
+            .folder(id)
+            .map_or_else(|| "team".to_string(), |f| f.name.clone());
+        if !path.exists() {
+            let template = format!(
+                "# {team}\n\nInstructions for this team: its goal, its rules, its priorities.\n"
+            );
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, template));
+            if let Err(e) = written {
+                self.status_msg = Some(format!("cannot create {}: {e}", path.display()));
+                return;
+            }
+        }
+        match self.spawn_session(
+            format!("edit {team}"),
+            editor_command(&path),
+            Place::Replace,
+        ) {
+            Ok(session) => {
+                if let Some(s) = self.session_mut(session) {
+                    s.ephemeral = true;
+                    s.folder = None;
+                }
+                self.view = View::Terminals;
+                self.mode = Mode::Terminal;
+            }
+            Err(e) => self.status_msg = Some(format!("cannot open the editor: {e:#}")),
+        }
     }
 
     pub fn theme(&self) -> &'static Theme {
@@ -352,20 +575,63 @@ impl App {
                 }
             }
             AppEvent::PtyClosed(id) => tracing::debug!(id, "pty reader closed"),
+            AppEvent::Hook(id, event) => self.on_hook(id, &event),
         }
     }
 
     /// Per-frame housekeeping: exits (with a toast), activity windows, expired toasts.
     pub fn tick(&mut self, now: Instant) {
+        let mut closed_editors = Vec::new();
         for session in &mut self.sessions {
             session.tick(now);
+            for done in session.take_finished() {
+                if done.duration < NOTABLE_COMMAND {
+                    continue;
+                }
+                let ok = done.code == 0;
+                self.last_result = Some((now, ok));
+                if self.focused != Some(session.id) {
+                    let code = if ok {
+                        String::new()
+                    } else {
+                        format!(" ({})", done.code)
+                    };
+                    let text = format!(
+                        "{}{code} · {} — {}",
+                        truncate(&done.text, 30),
+                        format_duration(done.duration),
+                        session.name
+                    );
+                    self.toasts.push(Toast {
+                        text,
+                        ok,
+                        born: now,
+                    });
+                }
+            }
             if session.poll_exit() {
+                if session.ephemeral {
+                    closed_editors.push(session.id);
+                    continue;
+                }
                 let (text, ok) = match session.status {
                     Status::Exited(Some(0)) => (format!("{} exited", session.name), true),
                     Status::Exited(Some(code)) => {
                         (format!("{} exited ({code})", session.name), false)
                     }
                     _ => (format!("{} killed", session.name), false),
+                };
+                // An agent that stops right away printed why (e.g. a project Claude does not
+                // trust yet): show it.
+                let early = now.saturating_duration_since(session.started) < AGENT_EARLY_EXIT;
+                let reason = session
+                    .agent
+                    .as_ref()
+                    .filter(|_| early)
+                    .and_then(|_| first_screen_line(session));
+                let text = match reason {
+                    Some(reason) => format!("{text}: {}", truncate(&reason, 70)),
+                    None => text,
                 };
                 self.toasts.push(Toast {
                     text,
@@ -378,6 +644,17 @@ impl App {
             .retain(|t| now.saturating_duration_since(t.born) < TOAST_LIFE);
         let excess = self.toasts.len().saturating_sub(MAX_TOASTS);
         self.toasts.drain(..excess);
+        // An instructions editor was closed: back to the canvas, with the new text.
+        for id in closed_editors {
+            self.close_session(id);
+            self.reload_consignes();
+            self.set_view(View::Canvas);
+        }
+        if now.saturating_duration_since(self.consigne_checked) > CONSIGNE_RELOAD {
+            self.reload_consignes();
+            self.consigne_checked = now;
+        }
+        self.canvas_tick(now);
     }
 
     /// How long the main loop may sleep before the next frame is due.
@@ -389,9 +666,16 @@ impl App {
             let age = now.saturating_duration_since(t.born);
             age < TOAST_SLIDE || age > TOAST_LIFE - TOAST_FADE
         });
-        if switching || toast_moving {
+        if switching || toast_moving || self.canvas.animating(now) {
             Duration::from_millis(16)
-        } else if self.sessions.iter().any(|s| s.is_busy(now)) {
+        } else if self
+            .sessions
+            .iter()
+            .any(|s| s.is_busy(now) || s.needs_user(now))
+            || self
+                .last_result
+                .is_some_and(|(t, _)| now.saturating_duration_since(t) < REACTION)
+        {
             Duration::from_millis(80)
         } else {
             Duration::from_millis(250)
@@ -413,7 +697,12 @@ impl App {
                 .iter()
                 .map(|s| (format!("go to {}", s.name), Command::GoTo(s.id))),
         );
-        entries.push(("new folder".into(), Command::NewFolder));
+        entries.push(("new team".into(), Command::NewFolder));
+        let view = match self.view {
+            View::Terminals => "show canvas",
+            View::Canvas => "show terminals",
+        };
+        entries.push((view.into(), Command::ToggleView));
         if self.focused.is_some() {
             entries.push(("split vertical │".into(), Command::Split(Split::Right)));
             entries.push(("split horizontal ─".into(), Command::Split(Split::Down)));
@@ -464,7 +753,7 @@ impl App {
         ui::layout(self.area, self.sidebar_width())
     }
 
-    fn main_area(&self) -> Rect {
+    pub(crate) fn main_area(&self) -> Rect {
         self.screen().1
     }
 
@@ -482,7 +771,7 @@ impl App {
     }
 
     /// Shows session `id`: focuses its pane if visible, else puts it in the focused pane.
-    fn show_session(&mut self, id: u32) {
+    pub(crate) fn show_session(&mut self, id: u32) {
         if self.focused == Some(id) {
             return;
         }
@@ -534,11 +823,17 @@ impl App {
             Action::Focus => match self.cursor_row() {
                 Some(Row::Folder(id)) => self.toggle_folder(id),
                 Some(Row::Session(id)) => {
+                    self.view = View::Terminals;
                     self.show_session(id);
                     self.mode = Mode::Terminal;
                 }
                 None => {}
             },
+            Action::Cancel if self.mode == Mode::Onboarding => {
+                self.picked = 1;
+                self.confirm();
+            }
+            Action::Cancel if self.canvas_cancel() => {}
             Action::Leave | Action::Cancel => {
                 self.mode = Mode::Workspace;
                 self.menu = None;
@@ -561,6 +856,8 @@ impl App {
             Action::Split(dir) => self.run(Command::Split(dir)),
             Action::ClosePane => self.run(Command::ClosePane),
             Action::ToggleSidebar => self.toggle_sidebar(),
+            Action::ToggleView => self.run(Command::ToggleView),
+            Action::NewTeam => self.run(Command::NewFolder),
             Action::Help => self.mode = Mode::Help,
             Action::FocusPane(dir) => {
                 let target = self
@@ -583,6 +880,7 @@ impl App {
                             menu.picked = step(menu.picked, menu.items.len(), down);
                         }
                     }
+                    Mode::Onboarding => self.picked = step(self.picked, 2, down),
                     _ => self.move_cursor(step(self.cursor, self.rows().len(), down)),
                 }
             }
@@ -639,6 +937,7 @@ impl App {
                         if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
                             folder.name = name;
                         }
+                        self.save_canvas();
                     }
                     None => {}
                 }
@@ -653,6 +952,17 @@ impl App {
                     && let Some(&(_, action)) = menu.items.get(menu.picked)
                 {
                     self.run_menu(action, menu.at);
+                }
+            }
+            Mode::Onboarding => {
+                let choice = if self.picked == 0 {
+                    AgentChoice::Connected
+                } else {
+                    AgentChoice::Declined
+                };
+                self.set_claude(choice);
+                if !self.sessions.is_empty() {
+                    self.mode = Mode::Terminal;
                 }
             }
             Mode::Workspace | Mode::Terminal | Mode::Help => {}
@@ -684,6 +994,10 @@ impl App {
                 }
             }
             Command::ToggleSidebar => self.toggle_sidebar(),
+            Command::ToggleView => self.set_view(match self.view {
+                View::Terminals => View::Canvas,
+                View::Canvas => View::Terminals,
+            }),
             Command::Theme(index) => self.theme = index,
             Command::Quit => self.should_quit = true,
         }
@@ -711,10 +1025,210 @@ impl App {
             MenuAction::Detach => self.status_msg = Some(DETACH_SOON.into()),
             MenuAction::SetTheme(index) => self.theme = index,
             MenuAction::ToggleSidebar => self.toggle_sidebar(),
+            MenuAction::EditConsigne(id) => self.edit_consigne(id),
+            MenuAction::NewTeamAt(x, y) => {
+                let id = self.new_folder();
+                if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
+                    folder.pos = (x, y);
+                }
+                self.save_canvas();
+                self.start_rename(Target::Folder(id));
+            }
+            MenuAction::ToggleClaude => {
+                let connected = self.config.agents.claude == Some(AgentChoice::Connected);
+                self.set_claude(if connected {
+                    AgentChoice::Declined
+                } else {
+                    AgentChoice::Connected
+                });
+            }
+            MenuAction::AgentRoles(team) => self.open_menu(self.role_menu(team), at),
+            MenuAction::AddAgent(team, role) => self.add_agent(team, role),
         }
     }
 
-    fn start_rename(&mut self, target: Target) {
+    pub(crate) fn role_menu(&self, team: u32) -> Vec<(String, MenuAction)> {
+        (0..)
+            .zip(agent::ROLES)
+            .map(|(i, (role, _))| (format!("+ {role}"), MenuAction::AddAgent(team, i)))
+            .collect()
+    }
+
+    /// Starts a Claude Code agent with the `role`-th role in `team`, in its own worktree when
+    /// the project is a git repository.
+    fn add_agent(&mut self, team: u32, role: usize) {
+        if self.config.agents.claude != Some(AgentChoice::Connected) {
+            self.mode = Mode::Onboarding;
+            self.picked = 0;
+            return;
+        }
+        let Some(&(role, _)) = agent::ROLES.get(role) else {
+            return;
+        };
+        let (Some(data), Some(exe), Some(channel)) = (
+            self.paths.project.clone(),
+            self.paths.exe.clone(),
+            self.channel.as_ref(),
+        ) else {
+            self.status_msg = Some("agents need a project folder and the chiika channel".into());
+            return;
+        };
+        let (port, token) = (channel.port, channel.token.clone());
+        let Some(claude) = agent::claude_exe() else {
+            self.status_msg = Some("claude code not found in PATH".into());
+            return;
+        };
+        let root = data
+            .parent()
+            .map_or_else(|| data.clone(), Path::to_path_buf);
+        let team_name = self
+            .folder(team)
+            .map_or_else(|| "team".to_string(), |f| f.name.clone());
+        let id = self.next_id;
+        if let Err(e) = agent::ensure_gitignore(&data) {
+            tracing::warn!("cannot write .chiika/.gitignore: {e}");
+        }
+        // Claude creates the worktree itself (`--worktree`, from the project folder): it then
+        // trusts it like the project, with no question at start.
+        // ponytail: git runs on the UI thread (a few ms, once per agent).
+        let worktree = if agent::has_commit(&root) {
+            let base = format!("{}-{role}", agent::slug(&team_name));
+            Some(agent::free_worktree_name(&root, &base, id))
+        } else {
+            self.toasts.push(Toast {
+                text: format!("{role} works in the project folder (no git commit to branch from)"),
+                ok: false,
+                born: Instant::now(),
+            });
+            None
+        };
+        let workdir = root.clone();
+        let instructions = self
+            .paths
+            .team_file(team)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        let prompt = agent::system_prompt(
+            role,
+            &team_name,
+            &instructions,
+            &workdir,
+            worktree.as_deref(),
+        );
+        let settings = data
+            .join("agents")
+            .join(format!("agent-{id}"))
+            .join("settings.json");
+        let written = settings
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&settings, agent::hook_settings(&exe)));
+        if let Err(e) = written {
+            self.status_msg = Some(format!("cannot write {}: {e}", settings.display()));
+            return;
+        }
+        let mut cmd = CommandBuilder::new(claude);
+        cmd.arg("--settings");
+        cmd.arg(&settings);
+        cmd.arg("--append-system-prompt");
+        cmd.arg(&prompt);
+        if let Some(name) = &worktree {
+            cmd.arg("--worktree");
+            cmd.arg(name);
+        }
+        cmd.cwd(&workdir);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("CHIIKA_PORT", port.to_string());
+        cmd.env("CHIIKA_TOKEN", token);
+        cmd.env("CHIIKA_SESSION", id.to_string());
+        // Set when chiika itself runs inside Claude Code: it would turn off the agent's transcripts.
+        cmd.env_remove("CLAUDE_CODE_CHILD_SESSION");
+        match self.spawn_session(role.to_string(), cmd, Place::Hidden) {
+            Ok(session) => {
+                if let Some(s) = self.session_mut(session) {
+                    s.folder = Some(team);
+                    s.agent = Some(AgentInfo::new(team, workdir, worktree, Instant::now()));
+                }
+                self.select_row(Row::Session(session));
+            }
+            Err(e) => self.status_msg = Some(format!("cannot start {role}: {e:#}")),
+        }
+    }
+
+    /// A hook of an agent: new state, and a notification when it needs the user or is done.
+    fn on_hook(&mut self, id: u32, event: &HookEvent) {
+        let now = Instant::now();
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        let Some(agent) = session.agent.as_mut() else {
+            return;
+        };
+        let Some(state) = agent.apply(event, now) else {
+            return;
+        };
+        let team = self
+            .folders
+            .iter()
+            .find(|f| f.id == agent.team)
+            .map_or("no team", |f| f.name.as_str());
+        let note = match state {
+            AgentState::Waiting => Some((format!("{} needs you — {team}", session.name), false)),
+            AgentState::Done if self.focused != Some(id) => {
+                Some((format!("{} is done — {team}", session.name), true))
+            }
+            _ => None,
+        };
+        if state == AgentState::Done {
+            self.last_result = Some((now, true));
+        }
+        if let Some((text, ok)) = note {
+            self.toasts.push(Toast {
+                text,
+                ok,
+                born: now,
+            });
+        }
+    }
+
+    /// Inspector buttons.
+    pub(crate) fn agent_open(&mut self, id: u32) {
+        self.view = View::Terminals;
+        self.show_session(id);
+        self.mode = Mode::Terminal;
+    }
+
+    pub(crate) fn agent_interrupt(&mut self, id: u32) {
+        self.send_to(id, b"\x1b");
+    }
+
+    /// Sends the team instructions again, as a pasted message.
+    pub(crate) fn agent_resend(&mut self, id: u32) {
+        let Some(team) = self
+            .session(id)
+            .and_then(|s| s.agent.as_ref())
+            .map(|a| a.team)
+        else {
+            return;
+        };
+        let instructions = self
+            .paths
+            .team_file(team)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        let text = format!(
+            "Reminder of the team instructions:\n{}",
+            instructions.trim()
+        );
+        let bracketed = self
+            .session(id)
+            .is_some_and(|s| s.parser.lock().unwrap().screen().bracketed_paste());
+        let mut bytes = encode_paste(&text, bracketed);
+        bytes.push(b'\r');
+        self.send_to(id, &bytes);
+    }
+
+    pub(crate) fn start_rename(&mut self, target: Target) {
         let name = match target {
             Target::Session(id) => self.session(id).map(|s| s.name.clone()),
             Target::Folder(id) => self.folder(id).map(|f| f.name.clone()),
@@ -726,7 +1240,7 @@ impl App {
         }
     }
 
-    fn open_menu(&mut self, items: Vec<(String, MenuAction)>, at: Position) {
+    pub(crate) fn open_menu(&mut self, items: Vec<(String, MenuAction)>, at: Position) {
         self.menu = Some(Menu {
             items,
             picked: 0,
@@ -735,18 +1249,20 @@ impl App {
         self.mode = Mode::Menu;
     }
 
-    fn session_menu(&self, id: u32) -> Vec<(String, MenuAction)> {
+    pub(crate) fn session_menu(&self, id: u32) -> Vec<(String, MenuAction)> {
         vec![
             ("rename".into(), MenuAction::Rename(Target::Session(id))),
-            ("move to folder…".into(), MenuAction::MoveMenu(id)),
+            ("move to team…".into(), MenuAction::MoveMenu(id)),
             ("close session".into(), MenuAction::CloseSession(id)),
         ]
     }
 
-    fn folder_menu(&self, id: u32) -> Vec<(String, MenuAction)> {
+    pub(crate) fn folder_menu(&self, id: u32) -> Vec<(String, MenuAction)> {
         vec![
+            ("add agent…".into(), MenuAction::AgentRoles(id)),
             ("rename".into(), MenuAction::Rename(Target::Folder(id))),
-            ("delete folder".into(), MenuAction::DeleteFolder(id)),
+            ("edit instructions".into(), MenuAction::EditConsigne(id)),
+            ("delete team".into(), MenuAction::DeleteFolder(id)),
         ]
     }
 
@@ -799,6 +1315,11 @@ impl App {
             "collapse sidebar"
         };
         items.push((sidebar.into(), MenuAction::ToggleSidebar));
+        let claude = match self.config.agents.claude {
+            Some(AgentChoice::Connected) => "claude code: connected ✓",
+            _ => "connect claude code",
+        };
+        items.push((claude.into(), MenuAction::ToggleClaude));
         items
     }
 
@@ -816,8 +1337,8 @@ impl App {
             .iter()
             .map(|f| (format!("→ {}", f.name), MenuAction::MoveTo(id, Some(f.id))))
             .collect();
-        items.push(("→ no folder".into(), MenuAction::MoveTo(id, None)));
-        items.push(("+ new folder".into(), MenuAction::MoveToNewFolder(id)));
+        items.push(("→ no team".into(), MenuAction::MoveTo(id, None)));
+        items.push(("+ new team".into(), MenuAction::MoveToNewFolder(id)));
         items
     }
 
@@ -833,20 +1354,32 @@ impl App {
             })
     }
 
-    fn new_folder(&mut self) -> u32 {
+    /// A new team, placed on the canvas after the others.
+    pub(crate) fn new_folder(&mut self) -> u32 {
         let id = self.next_folder;
         self.next_folder += 1;
         self.folders.push(Folder {
             id,
-            name: format!("folder {id}"),
+            name: format!("team {id}"),
             collapsed: false,
+            pos: canvas::team_position(self.folders.len()),
+            consigne: None,
         });
+        self.save_canvas();
         id
     }
 
     fn toggle_folder(&mut self, id: u32) {
         if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
             folder.collapsed = !folder.collapsed;
+        }
+        self.save_canvas();
+    }
+
+    /// Moves the sidebar cursor to `row` when it is visible.
+    pub(crate) fn select_row(&mut self, row: Row) {
+        if let Some(i) = self.rows().iter().position(|r| *r == row) {
+            self.cursor = i;
         }
     }
 
@@ -858,9 +1391,10 @@ impl App {
         }
         self.folders.retain(|f| f.id != id);
         self.cursor = clamp_index(self.cursor, self.rows().len());
+        self.save_canvas();
     }
 
-    fn move_to(&mut self, id: u32, folder: Option<u32>) {
+    pub(crate) fn move_to(&mut self, id: u32, folder: Option<u32>) {
         let Some(session) = self.session_mut(id) else {
             return;
         };
@@ -966,6 +1500,12 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.left_click(pos),
             MouseEventKind::Down(MouseButton::Right) => self.right_click(pos),
+            MouseEventKind::Drag(MouseButton::Left) if self.canvas.grab.is_some() => {
+                self.canvas_drag(pos)
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.canvas.grab.is_some() => {
+                self.canvas_release(pos)
+            }
             MouseEventKind::Moved => {
                 if let Some(index) = self.menu_item_at(pos)
                     && let Some(menu) = &mut self.menu
@@ -998,6 +1538,14 @@ impl App {
     }
 
     fn left_click(&mut self, pos: Position) {
+        if self.mode == Mode::Onboarding {
+            let (_, connect, later) = ui::onboarding_layout(self.area);
+            if connect.contains(pos) || later.contains(pos) {
+                self.picked = usize::from(later.contains(pos));
+                self.confirm();
+            }
+            return;
+        }
         if self.mode == Mode::Help {
             self.mode = Mode::Workspace;
             return;
@@ -1026,6 +1574,10 @@ impl App {
             self.open_app_menu();
             return;
         }
+        if let Some(view) = ui::tab_at(sidebar, self.sidebar_collapsed, pos) {
+            self.set_view(view);
+            return;
+        }
         if let Some(index) = self.row_at(pos) {
             let now = Instant::now();
             let double = self.last_click.is_some_and(|(t, i)| {
@@ -1038,6 +1590,12 @@ impl App {
                 Some(Row::Session(id)) if double => self.start_rename(Target::Session(id)),
                 Some(Row::Session(id)) => self.show_session(id),
                 None => {}
+            }
+            return;
+        }
+        if self.view == View::Canvas {
+            if self.main_area().contains(pos) {
+                self.canvas_press(pos);
             }
             return;
         }
@@ -1064,6 +1622,12 @@ impl App {
             self.open_menu(items, pos);
             return;
         }
+        if self.view == View::Canvas {
+            if self.main_area().contains(pos) {
+                self.canvas_right_click(pos);
+            }
+            return;
+        }
         let pane = self
             .layout
             .as_ref()
@@ -1075,6 +1639,12 @@ impl App {
     }
 
     fn wheel(&mut self, pos: Position, up: bool) {
+        if self.view == View::Canvas {
+            if self.main_area().contains(pos) {
+                self.canvas_wheel(up);
+            }
+            return;
+        }
         let pane = self
             .layout
             .as_ref()
@@ -1103,15 +1673,14 @@ impl App {
 
     /// Starts a session with the first of `shells` that spawns, in the cursor's folder.
     fn new_session(&mut self, shells: &[&ShellSpec], place: Place) {
-        let id = self.next_id;
-        let (rows, cols) = ui::inner_size(self.main_area());
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        let cwd = match std::env::current_dir() {
+        // Like tmux: start where the focused shell is, when its integration told us.
+        let focused_cwd = self
+            .focused
+            .and_then(|id| self.session(id))
+            .and_then(|s| s.marks(|m| m.cwd.clone()))
+            .map(std::path::PathBuf::from)
+            .filter(|dir| dir.is_dir());
+        let cwd = match focused_cwd.map_or_else(std::env::current_dir, Ok) {
             Ok(cwd) => cwd,
             Err(e) => {
                 self.status_msg = Some(format!("cannot start a shell: {e}"));
@@ -1120,18 +1689,14 @@ impl App {
         };
         let mut last_err = anyhow::anyhow!("no shell found");
         for shell in shells {
-            let name = format!("{} {id}", shell.label);
-            match Session::spawn(id, name, shell.command(&cwd), size, self.tx.clone()) {
-                Ok(mut session) => {
+            let name = format!("{} {}", shell.label, self.next_id);
+            match self.spawn_session(name, shell.command(&cwd), place) {
+                Ok(id) => {
                     tracing::info!(id, shell = shell.label, "session started");
-                    session.folder = self.context_folder();
-                    self.sessions.push(session);
-                    self.next_id += 1;
-                    self.place(id, place);
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!(id, shell = shell.label, "shell spawn failed: {e:#}");
+                    tracing::warn!(shell = shell.label, "shell spawn failed: {e:#}");
                     last_err = e;
                 }
             }
@@ -1139,7 +1704,33 @@ impl App {
         self.status_msg = Some(format!("cannot start a shell: {last_err:#}"));
     }
 
+    /// Starts `cmd` in a new session of the cursor's team and shows it at `place`.
+    fn spawn_session(
+        &mut self,
+        name: String,
+        cmd: CommandBuilder,
+        place: Place,
+    ) -> anyhow::Result<u32> {
+        let id = self.next_id;
+        let (rows, cols) = ui::inner_size(self.main_area());
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut session = Session::spawn(id, name, cmd, size, self.tx.clone())?;
+        session.folder = self.context_folder();
+        self.sessions.push(session);
+        self.next_id += 1;
+        self.place(id, place);
+        Ok(id)
+    }
+
     fn place(&mut self, id: u32, place: Place) {
+        if let Place::Hidden = place {
+            return;
+        }
         match (&mut self.layout, self.focused, place) {
             (Some(layout), Some(focused), Place::Split(dir)) => {
                 layout.split(focused, id, dir);
@@ -1161,6 +1752,14 @@ impl ShellSpec {
             Some(prog) => {
                 let mut cmd = CommandBuilder::new(prog);
                 cmd.args(self.args);
+                if self.integrated {
+                    // After the user's profile: wraps their prompt, survives their settings.
+                    cmd.args([
+                        "-NoExit",
+                        "-EncodedCommand",
+                        &crate::shell::encoded_command(),
+                    ]);
+                }
                 cmd
             }
             None => CommandBuilder::new_default_prog(),
@@ -1171,19 +1770,55 @@ impl ShellSpec {
     }
 }
 
+/// Whether an executable named `prog` is in one of the `PATH` directories.
+fn in_path(prog: &str) -> bool {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    // symlink_metadata: Store aliases (pwsh in WindowsApps) are reparse points that `exists()`
+    // can fail to follow.
+    std::env::split_paths(&path).any(|dir| dir.join(prog).symlink_metadata().is_ok())
+}
+
 /// Shells whose executable is found in `PATH` (the default shell always is).
 fn available_shells() -> Vec<&'static ShellSpec> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
     SHELLS
         .iter()
-        .filter(|shell| {
-            shell.prog.is_none_or(|prog| {
-                // symlink_metadata: Store aliases (pwsh in WindowsApps) are reparse points that
-                // `exists()` can fail to follow.
-                std::env::split_paths(&path).any(|dir| dir.join(prog).symlink_metadata().is_ok())
-            })
-        })
+        .filter(|shell| shell.prog.is_none_or(in_path))
         .collect()
+}
+
+/// Claude Code's command line (npm installs `claude.cmd` on Windows).
+fn claude_installed() -> bool {
+    ["claude.exe", "claude.cmd", "claude"]
+        .into_iter()
+        .any(in_path)
+}
+
+/// A terminal editor for `path`: `edit` on Windows (else Notepad), `$EDITOR` or `nano` elsewhere.
+fn editor_command(path: &Path) -> CommandBuilder {
+    let editor = if cfg!(windows) {
+        if in_path("edit.exe") {
+            "edit.exe".to_string()
+        } else {
+            "notepad.exe".to_string()
+        }
+    } else {
+        std::env::var("EDITOR").unwrap_or_else(|_| "nano".into())
+    };
+    let mut cmd = CommandBuilder::new(editor);
+    cmd.arg(path);
+    cmd.env("TERM", "xterm-256color");
+    if let Some(dir) = path.parent() {
+        cmd.cwd(dir);
+    }
+    cmd
+}
+
+/// The line shown in a team box: the first one that is not empty nor a Markdown title.
+pub fn consigne_excerpt(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
 }
 
 /// Sidebar order: each folder followed by its sessions (unless collapsed), then loose sessions.
@@ -1230,6 +1865,8 @@ pub fn key_action(mode: Mode, key: KeyEvent, has_session: bool, app_cursor: bool
         Mode::Terminal => encode_key(key, app_cursor).map_or(Action::None, Action::Send),
         Mode::Workspace => match key.code {
             KeyCode::Enter if has_session => Action::Focus,
+            KeyCode::Tab => Action::ToggleView,
+            KeyCode::Esc => Action::Cancel,
             KeyCode::Down => Action::Next,
             KeyCode::Up => Action::Prev,
             KeyCode::PageUp => Action::ScrollPage(true),
@@ -1249,9 +1886,17 @@ pub fn key_action(mode: Mode, key: KeyEvent, has_session: bool, app_cursor: bool
             KeyCode::Char('m') if has_session => Action::Move,
             KeyCode::Char('w') => Action::ClosePane,
             KeyCode::Char('b') => Action::ToggleSidebar,
+            KeyCode::Char('t') => Action::NewTeam,
             KeyCode::Char('?') => Action::Help,
             KeyCode::Char('j') => Action::Next,
             KeyCode::Char('k') => Action::Prev,
+            _ => Action::None,
+        },
+        Mode::Onboarding => match key.code {
+            KeyCode::Enter => Action::Confirm,
+            KeyCode::Esc => Action::Cancel,
+            KeyCode::Left | KeyCode::BackTab => Action::Prev,
+            KeyCode::Right | KeyCode::Tab => Action::Next,
             _ => Action::None,
         },
         Mode::Help => match key.code {
@@ -1279,6 +1924,27 @@ pub fn key_action(mode: Mode, key: KeyEvent, has_session: bool, app_cursor: bool
             _ => Action::None,
         },
     }
+}
+
+/// First line with text on a session's screen.
+fn first_screen_line(session: &Session) -> Option<String> {
+    let parser = session.parser.lock().unwrap();
+    let contents = parser.screen().contents();
+    contents
+        .lines()
+        .map(str::trim)
+        .find(|line| line.chars().any(char::is_alphanumeric))
+        .map(str::to_string)
+}
+
+/// Cuts `text` to `max` chars, ending with "…" when cut.
+pub fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 fn arrow_dir(code: KeyCode) -> Option<Dir> {
@@ -1326,6 +1992,8 @@ mod tests {
             id,
             name: format!("f{id}"),
             collapsed,
+            pos: (0, 0),
+            consigne: None,
         }
     }
 
@@ -1622,6 +2290,62 @@ mod tests {
     fn detach_is_greyed_out_until_the_daemon_exists() {
         assert!(!MenuAction::Detach.enabled());
         assert!(MenuAction::Bindings.enabled());
+    }
+
+    #[test]
+    fn truncate_keeps_short_text_and_marks_cuts() {
+        assert_eq!(truncate("cargo build", 30), "cargo build");
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(truncate("", 4), "");
+    }
+
+    #[test]
+    fn tab_switches_view_and_t_creates_a_team() {
+        let tab = key(KeyCode::Tab, KeyModifiers::NONE);
+        let t = key(KeyCode::Char('t'), KeyModifiers::NONE);
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            key_action(Mode::Workspace, tab, true, false),
+            Action::ToggleView
+        );
+        assert_eq!(key_action(Mode::Workspace, t, true, false), Action::NewTeam);
+        assert_eq!(
+            key_action(Mode::Workspace, esc, true, false),
+            Action::Cancel
+        );
+        assert_eq!(
+            key_action(Mode::Terminal, tab, true, false),
+            Action::Send(b"\t".to_vec())
+        );
+    }
+
+    #[test]
+    fn onboarding_keys() {
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        let right = key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            key_action(Mode::Onboarding, enter, true, false),
+            Action::Confirm
+        );
+        assert_eq!(
+            key_action(Mode::Onboarding, esc, true, false),
+            Action::Cancel
+        );
+        assert_eq!(
+            key_action(Mode::Onboarding, right, true, false),
+            Action::Next
+        );
+    }
+
+    #[test]
+    fn consigne_excerpt_skips_titles_and_blank_lines() {
+        assert_eq!(
+            consigne_excerpt("# backend\n\n  Rust API, tests first.\nmore"),
+            Some("Rust API, tests first.".into())
+        );
+        assert_eq!(consigne_excerpt("# only a title\n"), None);
+        assert_eq!(consigne_excerpt(""), None);
     }
 
     #[test]

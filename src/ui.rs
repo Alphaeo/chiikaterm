@@ -2,14 +2,19 @@ use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, Folder, Menu, Mode, Row, SWITCH_ANIM, TOAST_FADE, TOAST_LIFE, TOAST_SLIDE};
+use crate::agent::AgentState;
+use crate::app::{
+    App, Folder, Menu, Mode, Row, SWITCH_ANIM, TOAST_FADE, TOAST_LIFE, TOAST_SLIDE, View, truncate,
+};
+use crate::canvas;
 use crate::fx::{format_duration, gradient_border, sparkline, spinner, sweep};
+use crate::mascot;
 use crate::session::{Session, Status};
 use crate::theme::Theme;
 
@@ -34,15 +39,17 @@ pub const BINDINGS: &[(&str, &[(&str, &str)])] = &[
     (
         "Workspace",
         &[
-            ("Enter", "focus the shell / open or close a folder"),
+            ("Enter", "focus the shell / open or close a team"),
+            ("Tab", "switch between terminals and canvas"),
             ("j k ↑ ↓", "select"),
             ("n / N", "new shell / pick the shell"),
             ("|", "split vertical (side by side)"),
             ("-", "split horizontal (stacked)"),
             ("w", "unsplit (close the pane)"),
             ("r  F2", "rename"),
-            ("m", "move to a folder"),
-            ("x", "close the session / delete the folder"),
+            ("m", "move to a team"),
+            ("t", "new team"),
+            ("x", "close the session / delete the team"),
             ("b", "collapse or expand the sidebar"),
             (":  Ctrl+P", "command palette"),
             ("PgUp PgDn", "scroll the history"),
@@ -64,8 +71,13 @@ pub const BINDINGS: &[(&str, &[(&str, &str)])] = &[
             ("mouse wheel", "scroll the pane under the mouse"),
             ("click", "select / focus"),
             ("double-click", "rename a session"),
-            ("right-click", "menu of a session, folder or pane"),
+            ("right-click", "menu of a session, team, pane or canvas"),
+            (
+                "drag (canvas)",
+                "move a mascot to a team, a team, or the view",
+            ),
             ("≡ menu", "settings, bindings, detach"),
+            ("+ agent (canvas)", "start a Claude Code agent in a team"),
         ],
     ),
 ];
@@ -88,11 +100,109 @@ pub fn inner_size(pane: Rect) -> (u16, u16) {
 
 /// Where the rows go inside the sidebar: inside the border, one blank row under the title.
 pub fn cards_area(sidebar: Rect) -> Rect {
+    // Title + tabs + gap above; gap + menu button + border below; mascot + gap when shown.
+    let mascot = mascot_area(sidebar);
+    let reserved = if mascot.is_empty() {
+        6
+    } else {
+        6 + mascot.height + 1
+    };
     Rect::new(
         sidebar.x + 1,
-        sidebar.y + 2,
+        sidebar.y + 3,
         sidebar.width.saturating_sub(2),
-        sidebar.height.saturating_sub(5),
+        sidebar.height.saturating_sub(reserved),
+    )
+}
+
+/// The two view tabs under the sidebar title: (terminals, canvas).
+pub fn tabs(sidebar: Rect, compact: bool) -> (Rect, Rect) {
+    if sidebar.height < 3 || sidebar.width < 4 {
+        return (Rect::default(), Rect::default());
+    }
+    let y = sidebar.y + 1;
+    if compact {
+        return (
+            Rect::new(sidebar.x + 1, y, 1, 1),
+            Rect::new(sidebar.x + 2, y, 1, 1),
+        );
+    }
+    let width = sidebar.width.saturating_sub(2);
+    let first = width.min(13);
+    (
+        Rect::new(sidebar.x + 1, y, first, 1),
+        Rect::new(sidebar.x + 2 + first, y, width.saturating_sub(first + 1), 1),
+    )
+}
+
+pub fn tab_at(sidebar: Rect, compact: bool, pos: Position) -> Option<View> {
+    let (terminals, canvas) = tabs(sidebar, compact);
+    if terminals.contains(pos) {
+        Some(View::Terminals)
+    } else if canvas.contains(pos) {
+        Some(View::Canvas)
+    } else {
+        None
+    }
+}
+
+/// Status of a session in a few chars: running command, last result, or uptime.
+pub fn session_status(s: &Session, now: Instant, theme: &Theme) -> (String, Color) {
+    if let (Some(agent), Status::Running) = (&s.agent, s.status) {
+        return match agent.shown_state(now) {
+            AgentState::Starting => ("starting…".into(), theme.muted),
+            AgentState::Idle => ("idle".into(), theme.muted),
+            AgentState::Working => (
+                agent.tool.clone().unwrap_or_else(|| "thinking".into()),
+                theme.accent(s.id),
+            ),
+            AgentState::Waiting => ("! needs you".into(), theme.err),
+            AgentState::Done => ("✔ done".into(), theme.ok),
+        };
+    }
+    let since = |t: Instant| format_duration(now.saturating_duration_since(t));
+    match s.status {
+        Status::Exited(Some(code)) => (format!("exit {code}"), theme.muted),
+        Status::Exited(None) => ("killed".into(), theme.muted),
+        Status::Running => s.marks(|m| match (&m.running, &m.last) {
+            (Some(running), _) => (format!("▸ {}", since(running.started)), theme.accent(s.id)),
+            (None, Some(last)) if last.code == 0 => {
+                (format!("✔ {}", format_duration(last.duration)), theme.ok)
+            }
+            (None, Some(last)) => (format!("✖ {}", last.code), theme.err),
+            (None, None) => (since(s.started), theme.muted),
+        }),
+    }
+}
+
+/// Window and buttons of the first-launch window: (window, connect, not now).
+pub fn onboarding_layout(screen: Rect) -> (Rect, Rect, Rect) {
+    let width = 56.min(screen.width);
+    let height = 9.min(screen.height);
+    let window = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let y = window.bottom().saturating_sub(3);
+    let center = window.x + window.width / 2;
+    let connect = Rect::new(center.saturating_sub(17), y, 15, 1).intersection(window);
+    let later = Rect::new(center + 2, y, 14, 1).intersection(window);
+    (window, connect, later)
+}
+
+/// Above the menu button, only when the sidebar is open and tall enough to keep room for cards.
+pub fn mascot_area(sidebar: Rect) -> Rect {
+    if sidebar.width < 16 || sidebar.height < 24 {
+        return Rect::default();
+    }
+    let button = menu_button(sidebar);
+    Rect::new(
+        button.x,
+        button.y - 1 - mascot::HEIGHT,
+        button.width,
+        mascot::HEIGHT,
     )
 }
 
@@ -175,15 +285,29 @@ pub fn menu_rect(menu: &Menu, screen: Rect) -> Rect {
 pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     let (sidebar, main, status) = layout(frame.area(), app.sidebar_width());
     draw_sidebar(frame, app, sidebar, now);
-    draw_panes(frame, app, main, now);
+    match app.view {
+        View::Terminals => draw_panes(frame, app, main, now),
+        View::Canvas => canvas::draw(frame, app, main, now),
+    }
     draw_toasts(frame, app, main, now);
     match app.mode {
         Mode::Palette => draw_palette(frame, app),
         Mode::Menu => draw_menu(frame, app),
         Mode::Help => draw_bindings(frame, app),
+        Mode::Onboarding => draw_onboarding(frame, app),
         _ => {}
     }
     draw_status(frame, app, status, now);
+}
+
+/// Keeps the end of `text` (the useful part of a path), starting with "…" when cut.
+fn truncate_start(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - max.saturating_sub(1)).collect();
+    format!("…{tail}")
 }
 
 fn rounded(theme: &Theme) -> Block<'static> {
@@ -207,6 +331,59 @@ fn draw_sidebar(frame: &mut Frame, app: &App, sidebar: Rect, now: Instant) {
     frame
         .buffer_mut()
         .set_line(button.x, button.y, &label, button.width);
+
+    let (terminals, canvas_tab) = tabs(sidebar, compact);
+    let tab_style = |view: View| {
+        if app.view == view {
+            Style::new().fg(theme.on_pill).bg(theme.pill[0]).bold()
+        } else {
+            Style::new().fg(theme.muted)
+        }
+    };
+    let (terminals_label, canvas_label) = if compact {
+        ("▣", "◈")
+    } else {
+        (" ▣ terminals ", " ◈ canvas ")
+    };
+    let buf = frame.buffer_mut();
+    buf.set_stringn(
+        terminals.x,
+        terminals.y,
+        terminals_label,
+        usize::from(terminals.width),
+        tab_style(View::Terminals),
+    );
+    buf.set_stringn(
+        canvas_tab.x,
+        canvas_tab.y,
+        canvas_label,
+        usize::from(canvas_tab.width),
+        tab_style(View::Canvas),
+    );
+    if !compact && !terminals.is_empty() && terminals.right() < canvas_tab.x {
+        buf.set_string(
+            terminals.right(),
+            terminals.y,
+            "│",
+            Style::new().fg(theme.border),
+        );
+    }
+
+    let busy = app.sessions.iter().any(|s| s.is_busy(now));
+    let last_activity = app.sessions.iter().filter_map(Session::last_output).max();
+    let mood = if app.sessions.iter().any(|s| s.needs_user(now)) {
+        mascot::Mood::Alert
+    } else {
+        mascot::mood(now, app.last_result, busy, last_activity)
+    };
+    let elapsed = now.saturating_duration_since(app.epoch);
+    mascot::draw(
+        frame.buffer_mut(),
+        mascot_area(sidebar),
+        mood,
+        theme,
+        elapsed,
+    );
 
     let area = cards_area(sidebar);
     let rows = app.rows();
@@ -330,11 +507,7 @@ fn draw_card(buf: &mut Buffer, area: Rect, s: &Session, selected: bool, app: &Ap
         buf.set_string(area.right() - 2, area.y, frame, Style::new().fg(accent));
     }
 
-    let info = match s.status {
-        Status::Running => format_duration(now.saturating_duration_since(s.started)),
-        Status::Exited(Some(code)) => format!("exit {code}"),
-        Status::Exited(None) => "killed".into(),
-    };
+    let (info, info_color) = session_status(s, now, theme);
     let spark = if s.status == Status::Running {
         accent
     } else {
@@ -346,7 +519,7 @@ fn draw_card(buf: &mut Buffer, area: Rect, s: &Session, selected: bool, app: &Ap
         Span::raw("  "),
         Span::styled(sparkline(&s.activity.values()), Style::new().fg(spark)),
         Span::raw(" "),
-        Span::styled(info, Style::new().fg(theme.muted)),
+        Span::styled(info, Style::new().fg(info_color)),
     ]);
     if area.height > 1 {
         buf.set_line(area.x, area.y + 1, &line, area.width);
@@ -398,13 +571,32 @@ fn draw_pane(
         let scrolled = format!("↑{} lines ", screen.scrollback());
         title.push(Span::styled(scrolled, Style::new().fg(accent)));
     }
-    let info = match session.status {
-        Status::Running => format!(
-            " ⏱ {} ",
-            format_duration(now.saturating_duration_since(session.started))
+    let since = |t: Instant| format_duration(now.saturating_duration_since(t));
+    let marks = parser.callbacks();
+    let (info, info_color) = match (session.status, &marks.running, &marks.last) {
+        (Status::Exited(Some(code)), _, _) => (format!(" exit {code} "), theme.muted),
+        (Status::Exited(None), _, _) => (" killed ".into(), theme.muted),
+        (Status::Running, Some(running), _) => (
+            format!(
+                " ▸ {} · {} ",
+                truncate(&running.text, 30),
+                since(running.started)
+            ),
+            accent,
         ),
-        Status::Exited(Some(code)) => format!(" exit {code} "),
-        Status::Exited(None) => " killed ".into(),
+        (Status::Running, None, Some(last)) if last.code == 0 => (
+            format!(
+                " ✔ {} · {} ",
+                truncate(&last.text, 30),
+                format_duration(last.duration)
+            ),
+            theme.ok,
+        ),
+        (Status::Running, None, Some(last)) => (
+            format!(" ✖ {} ({}) ", truncate(&last.text, 30), last.code),
+            theme.err,
+        ),
+        (Status::Running, None, None) => (format!(" ◷ {} ", since(session.started)), theme.muted),
     };
     let border = if focused && app.mode != Mode::Terminal {
         accent
@@ -415,7 +607,7 @@ fn draw_pane(
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(border))
         .title(Line::from(title))
-        .title(Line::styled(info, Style::new().fg(theme.muted)).right_aligned());
+        .title(Line::styled(info, Style::new().fg(info_color)).right_aligned());
     let inner = block.inner(area);
     let mut widget = PseudoTerminal::new(screen).block(block);
     if !focused {
@@ -520,6 +712,50 @@ fn draw_menu(frame: &mut Frame, app: &App) {
             Span::styled(label.as_str(), Style::new().fg(color)),
         ]);
         frame.render_widget(line, line_area);
+    }
+}
+
+/// First launch: offer to connect Claude Code.
+fn draw_onboarding(frame: &mut Frame, app: &App) {
+    let theme = app.theme();
+    let (window, connect, later) = onboarding_layout(frame.area());
+    let accent = theme.accents[0];
+    let title = Span::styled(" welcome to chiika ✿ ", Style::new().fg(accent).bold());
+    let text = vec![
+        Line::raw(""),
+        Line::styled("  Claude Code is installed on this machine.", theme.text),
+        Line::styled(
+            "  Connect it to run agents from the canvas?",
+            Style::new().fg(theme.text),
+        ),
+        Line::styled(
+            "  (you can change this later in ≡ menu › settings)",
+            Style::new().fg(theme.muted),
+        ),
+    ];
+    frame.render_widget(Clear, window);
+    frame.render_widget(
+        Paragraph::new(text).block(rounded(theme).title(title)),
+        window,
+    );
+    gradient_border(
+        frame.buffer_mut(),
+        window,
+        theme.gradient.0,
+        theme.gradient.1,
+    );
+    for (i, (area, label)) in [(connect, "[  connect  ]"), (later, "[  not now  ]")]
+        .into_iter()
+        .enumerate()
+    {
+        let style = if i == app.picked {
+            Style::new().fg(theme.on_pill).bg(theme.pill[0]).bold()
+        } else {
+            Style::new().fg(theme.muted)
+        };
+        frame
+            .buffer_mut()
+            .set_stringn(area.x, area.y, label, usize::from(area.width), style);
     }
 }
 
@@ -631,6 +867,7 @@ fn draw_status(frame: &mut Frame, app: &App, status: Rect, now: Instant) {
         Mode::Palette => ("PALETTE", theme.pill[2]),
         Mode::Menu => ("MENU", theme.pill[2]),
         Mode::Help => ("BINDINGS", theme.pill[2]),
+        Mode::Onboarding => ("WELCOME", theme.pill[0]),
     };
     let mut left = vec![
         Span::styled("▐", Style::new().fg(color)),
@@ -649,7 +886,11 @@ fn draw_status(frame: &mut Frame, app: &App, status: Rect, now: Instant) {
         ]),
         (Some(msg), _) => left.push(Span::styled(msg.as_str(), Style::new().fg(theme.err))),
         (None, Some(s)) => {
-            let uptime = format_duration(now.saturating_duration_since(s.started));
+            // The shell's directory when its integration reports it, else its uptime.
+            let detail = s.marks(|m| m.cwd.clone()).map_or_else(
+                || format_duration(now.saturating_duration_since(s.started)),
+                |cwd| truncate_start(&cwd, 40),
+            );
             let count = match app.sessions.len() {
                 1 => "1 session".to_string(),
                 n => format!("{n} sessions"),
@@ -658,7 +899,7 @@ fn draw_status(frame: &mut Frame, app: &App, status: Rect, now: Instant) {
                 Span::styled("◆ ", Style::new().fg(theme.accent(s.id))),
                 Span::styled(s.name.as_str(), Style::new().fg(theme.text)),
                 Span::styled(
-                    format!(" · {uptime}  │ {count}"),
+                    format!(" · {detail}  │ {count}"),
                     Style::new().fg(theme.muted),
                 ),
             ]);
@@ -667,12 +908,16 @@ fn draw_status(frame: &mut Frame, app: &App, status: Rect, now: Instant) {
     }
     let left = Line::from(left);
     let hints = match app.mode {
-        Mode::Workspace => "| - split · w unsplit · b sidebar · : palette ",
+        Mode::Workspace if app.view == View::Canvas => {
+            "drag mascots · t team · Tab terminals · : palette "
+        }
+        Mode::Workspace => "| - split · w unsplit · Tab canvas · : palette ",
         Mode::Terminal => "Ctrl+Q workspace · Alt+←→↑↓ panes · Shift+PgUp scroll ",
         Mode::Rename => "↵ save · Esc cancel ",
         Mode::Palette => "↑↓ choose · ↵ run · Esc close ",
         Mode::Menu => "↑↓ choose · ↵ run · Esc close ",
         Mode::Help => "Esc close ",
+        Mode::Onboarding => "←→ choose · ↵ ok · Esc not now ",
     };
     let fits = left.width() + hints.chars().count() + 2 <= usize::from(status.width);
     frame.render_widget(left, status);
@@ -693,7 +938,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::app::AppEvent;
+    use crate::app::{AppEvent, Paths};
 
     fn row_text(terminal: &Terminal<TestBackend>, y: u16) -> String {
         let buf = terminal.backend().buffer();
@@ -742,6 +987,23 @@ mod tests {
     }
 
     #[test]
+    fn long_paths_keep_their_end() {
+        assert_eq!(truncate_start(r"C:\dev", 10), r"C:\dev");
+        assert_eq!(truncate_start(r"C:\Users\Admin\chiika", 10), r"…in\chiika");
+    }
+
+    #[test]
+    fn mascot_only_in_a_tall_open_sidebar() {
+        let tall = Rect::new(0, 0, SIDEBAR_WIDTH, 40);
+        let mascot = mascot_area(tall);
+        assert_eq!(mascot.height, mascot::HEIGHT);
+        assert!(cards_area(tall).bottom() < mascot.y);
+        assert!(mascot.bottom() < menu_button(tall).y);
+        assert!(mascot_area(Rect::new(0, 0, SIDEBAR_WIDTH, 20)).is_empty());
+        assert!(mascot_area(Rect::new(0, 0, RAIL_WIDTH, 40)).is_empty());
+    }
+
+    #[test]
     fn menu_button_sits_below_the_rows() {
         let sidebar = Rect::new(0, 0, 26, 20);
         let button = menu_button(sidebar);
@@ -766,7 +1028,7 @@ mod tests {
     #[test]
     fn draws_splits_folders_and_menus_at_any_size_without_panicking() {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(Rect::new(0, 0, 120, 40), tx);
+        let mut app = App::new(Rect::new(0, 0, 120, 40), tx, Paths::default());
         app.mode = Mode::Workspace;
         press(&mut app, KeyCode::Char('|'));
         press(&mut app, KeyCode::Char('-'));
@@ -774,7 +1036,7 @@ mod tests {
             KeyCode::Char('m'),
             KeyModifiers::NONE,
         ))));
-        // "+ new folder" is the last entry of the move menu.
+        // "+ new team" is the last entry of the move menu.
         let last = app.menu.as_ref().map_or(0, |m| m.items.len() - 1);
         for _ in 0..last {
             press(&mut app, KeyCode::Down);
@@ -783,35 +1045,93 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.layout.as_ref().map(|l| l.panes().len()), Some(3));
         assert_eq!(app.folders.len(), 1);
-        right_click(&mut app, 2, 2);
+        right_click(&mut app, 2, 3);
         assert_eq!(app.mode, Mode::Menu);
 
+        // The second shell plays an agent waiting for the user, selected: inspector shown.
+        let team = app.folders[0].id;
+        let mut agent = crate::agent::AgentInfo::new(
+            team,
+            std::path::PathBuf::from("w"),
+            Some("chiika/t/coder-2".into()),
+            Instant::now(),
+        );
+        agent.state = AgentState::Waiting;
+        agent.message = Some("asks permission to use Bash".into());
+        let agent_id = app.sessions[1].id;
+        app.sessions[1].agent = Some(agent);
+        app.sessions[1].folder = Some(team);
+        app.select_row(Row::Session(agent_id));
+        assert_eq!(app.inspected(), Some(agent_id));
+
+        // A mascot being dragged over the canvas.
+        let dragged = app.sessions[0].id;
+        app.canvas.grab = Some(canvas::Grab::Session {
+            id: dragged,
+            offset: (0, 0),
+            from: Position::new(0, 0),
+            dragging: true,
+        });
+        app.canvas.pointer = Position::new(40, 5);
+
         let now = Instant::now();
-        for (mode, collapsed) in [
+        let modes = [
             Mode::Workspace,
             Mode::Terminal,
             Mode::Rename,
             Mode::Palette,
             Mode::Menu,
             Mode::Help,
-        ]
-        .into_iter()
-        .flat_map(|mode| [(mode, false), (mode, true)])
-        {
-            app.sidebar_collapsed = collapsed;
-            app.mode = mode;
-            for (w, h) in [(120, 40), (40, 10), (27, 4), (5, 2), (1, 1)] {
-                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-                terminal.draw(|frame| draw(frame, &app, now)).unwrap();
+            Mode::Onboarding,
+        ];
+        for mode in modes {
+            for collapsed in [false, true] {
+                for view in [View::Terminals, View::Canvas] {
+                    app.sidebar_collapsed = collapsed;
+                    app.mode = mode;
+                    app.view = view;
+                    for (w, h) in [(120, 40), (40, 10), (27, 4), (5, 2), (1, 1)] {
+                        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                        terminal.draw(|frame| draw(frame, &app, now)).unwrap();
+                    }
+                }
             }
         }
         app.kill_all();
     }
 
     #[test]
+    fn tabs_sit_under_the_title() {
+        let sidebar = Rect::new(0, 0, SIDEBAR_WIDTH, 30);
+        let (terminals, canvas) = tabs(sidebar, false);
+        assert_eq!(terminals, Rect::new(1, 1, 13, 1));
+        assert_eq!(canvas, Rect::new(15, 1, 10, 1));
+        assert!(cards_area(sidebar).y > terminals.y);
+        assert_eq!(
+            tab_at(sidebar, false, Position::new(20, 1)),
+            Some(View::Canvas)
+        );
+        assert_eq!(
+            tab_at(sidebar, false, Position::new(3, 1)),
+            Some(View::Terminals)
+        );
+        assert_eq!(tab_at(sidebar, false, Position::new(3, 5)), None);
+        let rail = Rect::new(0, 0, RAIL_WIDTH, 30);
+        assert_eq!(tab_at(rail, true, Position::new(2, 1)), Some(View::Canvas));
+    }
+
+    #[test]
+    fn onboarding_buttons_are_inside_the_window() {
+        let (window, connect, later) = onboarding_layout(Rect::new(0, 0, 120, 40));
+        assert!(window.contains(connect.as_position()));
+        assert!(window.contains(later.as_position()));
+        assert!(connect.right() <= later.x);
+    }
+
+    #[test]
     fn starts_typing_in_the_shell_and_shows_how_to_leave() {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(Rect::new(0, 0, 120, 40), tx);
+        let mut app = App::new(Rect::new(0, 0, 120, 40), tx, Paths::default());
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
             .draw(|frame| draw(frame, &app, Instant::now()))
