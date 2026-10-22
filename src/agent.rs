@@ -214,11 +214,11 @@ impl AgentInfo {
     }
 }
 
+/// Last component of `path`, split on `/` and `\` whatever the OS: agents may report paths of
+/// another system (Windows paths seen from WSL, and the other way round).
 fn file_name(path: &str) -> String {
-    Path::new(path).file_name().map_or_else(
-        || path.to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
+    let path = path.trim_end_matches(['/', '\\']);
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
 /// `✎ api.rs`, `$ cargo test`, `read lib.rs`, or the tool's name.
@@ -484,6 +484,14 @@ mod tests {
             ..hook("Notification")
         };
         assert_eq!(a.apply(&question, now), Some(AgentState::Waiting));
+    }
+
+    #[test]
+    fn file_names_are_found_in_paths_of_any_system() {
+        assert_eq!(file_name(r"C:\p\src\api.rs"), "api.rs");
+        assert_eq!(file_name("/home/me/src/lib.rs"), "lib.rs");
+        assert_eq!(file_name("src/"), "src");
+        assert_eq!(file_name("main.rs"), "main.rs");
     }
 
     #[test]
