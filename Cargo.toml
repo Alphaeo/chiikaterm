@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+description = "A terminal workspace for shells and coding agents, with a canvas of teams"
+repository = "https://github.com/Alphaeo/chiikaterm"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
