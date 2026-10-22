@@ -3,6 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::protocol::{FinishedSnapshot, MarksSnapshot};
+
 /// Script run by chiika's PowerShell sessions, see `encoded_command`.
 const SCRIPT: &str = include_str!("shell_integration.ps1");
 
@@ -65,6 +67,45 @@ pub struct ShellMarks {
 impl ShellMarks {
     pub fn take_finished(&mut self) -> Vec<Finished> {
         std::mem::take(&mut self.finished)
+    }
+
+    /// What survives a reattach; times become "milliseconds ago".
+    pub fn snapshot(&self, now: Instant) -> MarksSnapshot {
+        let ago = |t: Instant| now.saturating_duration_since(t).as_millis() as u64;
+        MarksSnapshot {
+            integrated: self.integrated,
+            cwd: self.cwd.clone(),
+            running: self
+                .running
+                .as_ref()
+                .map(|r| (r.text.clone(), ago(r.started))),
+            last: self.last.as_ref().map(|f| FinishedSnapshot {
+                text: f.text.clone(),
+                code: f.code,
+                duration_ms: f.duration.as_millis() as u64,
+                ago_ms: ago(f.at),
+            }),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: &MarksSnapshot, now: Instant) -> ShellMarks {
+        let before = |ms: u64| now.checked_sub(Duration::from_millis(ms)).unwrap_or(now);
+        ShellMarks {
+            integrated: snapshot.integrated,
+            cwd: snapshot.cwd.clone(),
+            running: snapshot.running.as_ref().map(|(text, ago)| Running {
+                text: text.clone(),
+                started: before(*ago),
+            }),
+            last: snapshot.last.as_ref().map(|f| Finished {
+                text: f.text.clone(),
+                code: f.code,
+                duration: Duration::from_millis(f.duration_ms),
+                at: before(f.ago_ms),
+            }),
+            finished: Vec::new(),
+            pending: None,
+        }
     }
 
     fn on_osc(&mut self, params: &[&[u8]], now: Instant) {
@@ -208,6 +249,25 @@ mod tests {
         let parser = feed(b"\x1b]633;E;echo a\\x3b echo b\x07\x1b]133;C\x07");
         let running = parser.callbacks().running.as_ref().map(|r| r.text.clone());
         assert_eq!(running.as_deref(), Some("echo a; echo b"));
+    }
+
+    #[test]
+    fn marks_survive_a_snapshot() {
+        let mut parser = feed(
+            b"\x1b]9;9;C:\\p\x07\x1b]633;E;cargo test\x07\x1b]133;C\x07\x1b]133;D;101\x07\x1b]633;E;sleep 9\x07\x1b]133;C\x07",
+        );
+        let now = Instant::now();
+        let snapshot = parser.callbacks_mut().snapshot(now);
+        let restored = ShellMarks::from_snapshot(&snapshot, now);
+        assert!(restored.integrated);
+        assert_eq!(restored.cwd.as_deref(), Some("C:\\p"));
+        assert_eq!(
+            restored.running.as_ref().map(|r| r.text.as_str()),
+            Some("sleep 9")
+        );
+        let last = restored.last.clone().unwrap();
+        assert_eq!((last.text.as_str(), last.code), ("cargo test", 101));
+        assert_eq!(restored.snapshot(now), snapshot);
     }
 
     #[test]

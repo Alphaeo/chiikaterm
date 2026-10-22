@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 
 use crate::channel::HookEvent;
+use crate::protocol::AgentSnapshot;
 
 /// Roles offered when adding an agent, with the duty added to its system prompt.
 pub const ROLES: [(&str, &str); 4] = [
@@ -51,7 +52,7 @@ const SILENT_START: Duration = Duration::from_secs(6);
 const FILES_KEPT: usize = 6;
 const MESSAGE_KEPT: usize = 400;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentState {
     Starting,
     /// Waiting for a prompt.
@@ -92,6 +93,34 @@ impl AgentInfo {
             tool: None,
             message: None,
             files: Vec::new(),
+        }
+    }
+
+    /// What survives a reattach; `since` becomes "milliseconds ago".
+    pub fn snapshot(&self, now: Instant) -> AgentSnapshot {
+        AgentSnapshot {
+            team: self.team,
+            folder: self.folder.clone(),
+            worktree: self.worktree.clone(),
+            state: self.state,
+            since_ms: now.saturating_duration_since(self.since).as_millis() as u64,
+            tool: self.tool.clone(),
+            message: self.message.clone(),
+            files: self.files.clone(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: &AgentSnapshot, now: Instant) -> AgentInfo {
+        let since = Duration::from_millis(snapshot.since_ms);
+        AgentInfo {
+            team: snapshot.team,
+            folder: snapshot.folder.clone(),
+            worktree: snapshot.worktree.clone(),
+            state: snapshot.state,
+            since: now.checked_sub(since).unwrap_or(now),
+            tool: snapshot.tool.clone(),
+            message: snapshot.message.clone(),
+            files: snapshot.files.clone(),
         }
     }
 
@@ -404,6 +433,20 @@ mod tests {
             a.apply(&edit, now);
         }
         assert_eq!(a.files, ["c.rs", "d.rs", "e.rs", "f.rs", "g.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn agents_survive_a_snapshot() {
+        let now = Instant::now();
+        let mut a = agent(now);
+        a.state = AgentState::Waiting;
+        a.tool = Some("✎ api.rs".into());
+        a.files = vec!["api.rs".into()];
+        let later = now + Duration::from_secs(3);
+        let snapshot = a.snapshot(later);
+        assert_eq!(snapshot.since_ms, 3000);
+        let restored = AgentInfo::from_snapshot(&snapshot, later);
+        assert_eq!(restored.snapshot(later), snapshot);
     }
 
     #[test]

@@ -19,7 +19,7 @@ const MAX_MESSAGE: u64 = 256 * 1024;
 const TIMEOUT: Duration = Duration::from_millis(300);
 
 /// What a Claude Code hook reported.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HookEvent {
     /// `hook_event_name`: `PreToolUse`, `Stop`…
     pub name: String,
@@ -110,7 +110,7 @@ pub fn parse_hook(json: &[u8]) -> Option<HookEvent> {
 }
 
 /// 128 random bits, hex. `RandomState` is seeded by the OS: enough for a local per-run token.
-fn random_token() -> String {
+pub fn random_token() -> String {
     (0..2u64)
         .map(|i| {
             let mut hasher = RandomState::new().build_hasher();

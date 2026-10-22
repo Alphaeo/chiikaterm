@@ -54,7 +54,7 @@ pub const BINDINGS: &[(&str, &[(&str, &str)])] = &[
             (":  Ctrl+P", "command palette"),
             ("PgUp PgDn", "scroll the history"),
             ("?", "this list"),
-            ("q", "quit"),
+            ("q", "quit, or detach (keep shells running)"),
         ],
     ),
     (
@@ -699,9 +699,7 @@ fn draw_menu(frame: &mut Frame, app: &App) {
                 .buffer_mut()
                 .set_style(line_area, Style::new().bg(theme.surface));
         }
-        let color = if !action.enabled() {
-            theme.muted
-        } else if action.destructive() {
+        let color = if action.destructive() {
             theme.err
         } else {
             theme.text

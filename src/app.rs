@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use portable_pty::{CommandBuilder, PtySize};
+use portable_pty::PtySize;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -10,11 +10,13 @@ use ratatui::layout::{Position, Rect};
 
 use crate::agent::{self, AgentInfo, AgentState};
 use crate::canvas::{self, CanvasState};
-use crate::channel::{self, Channel, HookEvent};
+use crate::channel::{self, HookEvent};
 use crate::config::{self, AgentChoice, CanvasFile, Config, TeamEntry};
 use crate::fx::{format_duration, fuzzy_match};
 use crate::keys::{encode_key, encode_paste};
 use crate::layout::{Dir, Layout, Split};
+use crate::link::{self, Link};
+use crate::protocol::{ClientMsg, Launch, MarksSnapshot, SessionInfo};
 use crate::session::{Session, Status};
 use crate::theme::{THEMES, Theme};
 use crate::ui;
@@ -57,6 +59,12 @@ pub enum AppEvent {
     PtyClosed(u32),
     /// A Claude Code hook of the agent in this session, received by the chiika channel.
     Hook(u32, crate::channel::HookEvent),
+    /// The daemon reports that a session exited.
+    RemoteExited(u32, Option<u32>),
+    /// The daemon could not start a session.
+    SpawnFailed(u32, String),
+    /// The connection to the daemon ended, with the reason.
+    DaemonGone(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +202,10 @@ pub enum MenuAction {
     /// Opens the settings menu.
     Settings,
     Bindings,
+    /// Leave, keeping the daemon's sessions running.
     Detach,
+    /// Leave and close every session.
+    QuitAll,
     SetTheme(usize),
     ToggleSidebar,
     EditConsigne(u32),
@@ -211,19 +222,13 @@ impl MenuAction {
     pub fn destructive(self) -> bool {
         matches!(
             self,
-            MenuAction::CloseSession(_) | MenuAction::DeleteFolder(_)
+            MenuAction::CloseSession(_) | MenuAction::DeleteFolder(_) | MenuAction::QuitAll
         )
-    }
-
-    /// Greyed-out entries announce a feature that is not built yet.
-    pub fn enabled(self) -> bool {
-        self != MenuAction::Detach
     }
 }
 
-/// Shown when the greyed-out "detach" entry is picked.
-const DETACH_SOON: &str =
-    "detach needs the background daemon (planned): quitting chiika still closes its shells";
+/// Shown when "detach" is picked while chiika runs its sessions itself.
+const NO_DAEMON: &str = "no daemon is running: quitting chiika closes its shells";
 
 pub struct Menu {
     pub items: Vec<(String, MenuAction)>,
@@ -347,8 +352,14 @@ pub struct App {
     pub config: Config,
     paths: Paths,
     consigne_checked: Instant,
-    /// Where the agents' hooks report; `None` if it could not start.
-    channel: Option<Channel>,
+    /// The daemon hosting the sessions; `None` when chiika runs them itself (they end with it).
+    link: Option<Link>,
+    /// Port and token where the agents' hooks report: the daemon's channel, or chiika's own.
+    hooks: Option<(u16, String)>,
+    /// On exit, keep the daemon's sessions running.
+    pub detach: bool,
+    /// Printed once the terminal is restored.
+    exit_note: Option<String>,
     rename: Option<Target>,
     next_folder: u32,
     last_click: Option<(Instant, usize)>,
@@ -388,7 +399,10 @@ impl App {
                 .unwrap_or_default(),
             paths,
             consigne_checked: Instant::now(),
-            channel: None,
+            link: None,
+            hooks: None,
+            detach: false,
+            exit_note: None,
             rename: None,
             next_folder: 1,
             last_click: None,
@@ -396,7 +410,10 @@ impl App {
             area,
             tx,
         };
-        app.new_session(&available_shells(), Place::Replace);
+        app.connect_daemon();
+        if app.sessions.is_empty() {
+            app.new_session(&available_shells(), Place::Replace);
+        }
         // Start typing straight into the first shell, like tmux.
         if !app.sessions.is_empty() {
             app.mode = Mode::Terminal;
@@ -406,15 +423,110 @@ impl App {
         if let Some(id) = app.focused {
             app.focus(id);
         }
-        app.channel = channel::start(app.tx.clone())
-            .inspect_err(|e| tracing::warn!("chiika channel unavailable: {e}"))
-            .ok();
+        if app.link.is_none() {
+            app.hooks = channel::start(app.tx.clone())
+                .inspect_err(|e| tracing::warn!("chiika channel unavailable: {e}"))
+                .ok()
+                .map(|c| (c.port, c.token));
+        }
         let ask_claude = app.config.agents.claude.is_none() && claude_installed();
         if app.paths.config.is_some() && ask_claude {
             app.mode = Mode::Onboarding;
             app.picked = 0;
         }
         app
+    }
+
+    /// Attaches to the project's daemon (starting it if needed) and shows its sessions. Without
+    /// a daemon, sessions run inside chiika and end with it.
+    fn connect_daemon(&mut self) {
+        let (Some(data), Some(exe)) = (self.paths.project.clone(), self.paths.exe.clone()) else {
+            return;
+        };
+        let attached = match link::attach(&data, &exe) {
+            Ok(attached) => attached,
+            Err(e) => {
+                tracing::warn!("no daemon: {e:#}");
+                self.status_msg = Some(format!("no daemon ({e:#}): shells close with chiika"));
+                return;
+            }
+        };
+        let now = Instant::now();
+        for (info, screen) in &attached.sessions {
+            let session = Session::remote(info, screen, attached.link.clone(), now);
+            self.sessions.push(session);
+        }
+        self.next_id = self.sessions.iter().map(|s| s.id + 1).max().unwrap_or(1);
+        attached.link.listen(attached.reader, self.tx.clone());
+        self.hooks = attached.hooks;
+        self.link = Some(attached.link);
+        // One pane, on a shell rather than an agent (agents live in their team boxes).
+        let first = self
+            .sessions
+            .iter()
+            .find(|s| s.agent.is_none() && !s.ephemeral)
+            .or(self.sessions.first())
+            .map(|s| s.id);
+        if let Some(first) = first {
+            self.layout = Some(Layout::Pane(first));
+            self.focus(first);
+            self.relayout();
+        }
+    }
+
+    /// On exit: sessions run by chiika end with it; the daemon's keep running unless the user
+    /// chose to close everything.
+    pub fn shutdown(&mut self) {
+        match &self.link {
+            Some(link) if !self.detach => {
+                if let Err(e) = link.send(&ClientMsg::Shutdown) {
+                    tracing::warn!("cannot stop the daemon: {e}");
+                }
+            }
+            Some(link) => link.close(),
+            None => self.kill_all(),
+        }
+    }
+
+    /// What to print after leaving.
+    pub fn exit_note(&self) -> Option<String> {
+        if self.exit_note.is_some() {
+            return self.exit_note.clone();
+        }
+        let running = self
+            .sessions
+            .iter()
+            .filter(|s| s.status == Status::Running)
+            .count();
+        (self.link.is_some() && self.detach && running > 0).then(|| {
+            format!(
+                "chiika: detached, {running} session(s) keep running; run chiika here to come back"
+            )
+        })
+    }
+
+    /// Leaving: with a daemon, ask whether to keep the sessions running.
+    fn ask_quit(&mut self) {
+        if self.link.is_none() {
+            self.should_quit = true;
+            return;
+        }
+        let items = vec![
+            ("detach: keep everything running".into(), MenuAction::Detach),
+            ("quit and close all shells".into(), MenuAction::QuitAll),
+        ];
+        let at = Position::new(
+            (self.area.width / 2).saturating_sub(18),
+            (self.area.height / 2).saturating_sub(2),
+        );
+        self.open_menu(items, at);
+    }
+
+    /// Tells the daemon what to keep about session `id` (name, team, agent…).
+    fn sync_session(&self, id: u32) {
+        if let Some(session) = self.session(id) {
+            session.sync(Instant::now());
+        }
     }
 
     fn load_teams(&mut self) {
@@ -510,16 +622,13 @@ impl App {
                 return;
             }
         }
-        match self.spawn_session(
-            format!("edit {team}"),
-            editor_command(&path),
-            Place::Replace,
-        ) {
+        match self.spawn_session(format!("edit {team}"), editor_launch(&path), Place::Replace) {
             Ok(session) => {
                 if let Some(s) = self.session_mut(session) {
                     s.ephemeral = true;
                     s.folder = None;
                 }
+                self.sync_session(session);
                 self.view = View::Terminals;
                 self.mode = Mode::Terminal;
             }
@@ -576,6 +685,20 @@ impl App {
             }
             AppEvent::PtyClosed(id) => tracing::debug!(id, "pty reader closed"),
             AppEvent::Hook(id, event) => self.on_hook(id, &event),
+            AppEvent::RemoteExited(id, code) => {
+                if let Some(session) = self.session_mut(id) {
+                    session.set_exited(code);
+                }
+            }
+            AppEvent::SpawnFailed(id, error) => {
+                self.close_session(id);
+                self.status_msg = Some(format!("cannot start a session: {error}"));
+            }
+            AppEvent::DaemonGone(reason) => {
+                self.exit_note = Some(format!("chiika: {reason}"));
+                self.detach = true;
+                self.should_quit = true;
+            }
         }
     }
 
@@ -819,7 +942,7 @@ impl App {
         }
         match action {
             Action::None => {}
-            Action::Quit => self.should_quit = true,
+            Action::Quit => self.ask_quit(),
             Action::Focus => match self.cursor_row() {
                 Some(Row::Folder(id)) => self.toggle_folder(id),
                 Some(Row::Session(id)) => {
@@ -932,6 +1055,7 @@ impl App {
                         if let Some(session) = self.session_mut(id) {
                             session.name = name;
                         }
+                        self.sync_session(id);
                     }
                     Some(Target::Folder(id)) => {
                         if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
@@ -999,7 +1123,7 @@ impl App {
                 View::Canvas => View::Terminals,
             }),
             Command::Theme(index) => self.theme = index,
-            Command::Quit => self.should_quit = true,
+            Command::Quit => self.ask_quit(),
         }
     }
 
@@ -1022,7 +1146,15 @@ impl App {
             MenuAction::ClosePane(id) => self.close_pane(id),
             MenuAction::Settings => self.open_menu(self.settings_menu(), at),
             MenuAction::Bindings => self.mode = Mode::Help,
-            MenuAction::Detach => self.status_msg = Some(DETACH_SOON.into()),
+            MenuAction::Detach if self.link.is_some() => {
+                self.detach = true;
+                self.should_quit = true;
+            }
+            MenuAction::Detach => self.status_msg = Some(NO_DAEMON.into()),
+            MenuAction::QuitAll => {
+                self.detach = false;
+                self.should_quit = true;
+            }
             MenuAction::SetTheme(index) => self.theme = index,
             MenuAction::ToggleSidebar => self.toggle_sidebar(),
             MenuAction::EditConsigne(id) => self.edit_consigne(id),
@@ -1065,15 +1197,14 @@ impl App {
         let Some(&(role, _)) = agent::ROLES.get(role) else {
             return;
         };
-        let (Some(data), Some(exe), Some(channel)) = (
+        let (Some(data), Some(exe), Some((port, token))) = (
             self.paths.project.clone(),
             self.paths.exe.clone(),
-            self.channel.as_ref(),
+            self.hooks.clone(),
         ) else {
             self.status_msg = Some("agents need a project folder and the chiika channel".into());
             return;
         };
-        let (port, token) = (channel.port, channel.token.clone());
         let Some(claude) = agent::claude_exe() else {
             self.status_msg = Some("claude code not found in PATH".into());
             return;
@@ -1127,28 +1258,31 @@ impl App {
             self.status_msg = Some(format!("cannot write {}: {e}", settings.display()));
             return;
         }
-        let mut cmd = CommandBuilder::new(claude);
-        cmd.arg("--settings");
-        cmd.arg(&settings);
-        cmd.arg("--append-system-prompt");
-        cmd.arg(&prompt);
+        let mut argv = vec![
+            claude.display().to_string(),
+            "--settings".into(),
+            settings.display().to_string(),
+            "--append-system-prompt".into(),
+            prompt,
+        ];
         if let Some(name) = &worktree {
-            cmd.arg("--worktree");
-            cmd.arg(name);
+            argv.extend(["--worktree".into(), name.clone()]);
         }
-        cmd.cwd(&workdir);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("CHIIKA_PORT", port.to_string());
-        cmd.env("CHIIKA_TOKEN", token);
-        cmd.env("CHIIKA_SESSION", id.to_string());
+        let mut launch = Launch::new(argv, workdir.clone());
+        launch.env.extend([
+            ("CHIIKA_PORT".into(), port.to_string()),
+            ("CHIIKA_TOKEN".into(), token),
+            ("CHIIKA_SESSION".into(), id.to_string()),
+        ]);
         // Set when chiika itself runs inside Claude Code: it would turn off the agent's transcripts.
-        cmd.env_remove("CLAUDE_CODE_CHILD_SESSION");
-        match self.spawn_session(role.to_string(), cmd, Place::Hidden) {
+        launch.env_remove.push("CLAUDE_CODE_CHILD_SESSION".into());
+        match self.spawn_session(role.to_string(), launch, Place::Hidden) {
             Ok(session) => {
                 if let Some(s) = self.session_mut(session) {
                     s.folder = Some(team);
                     s.agent = Some(AgentInfo::new(team, workdir, worktree, Instant::now()));
                 }
+                self.sync_session(session);
                 self.select_row(Row::Session(session));
             }
             Err(e) => self.status_msg = Some(format!("cannot start {role}: {e:#}")),
@@ -1293,7 +1427,7 @@ impl App {
         vec![
             ("settings…".into(), MenuAction::Settings),
             ("bindings".into(), MenuAction::Bindings),
-            ("detach (soon)".into(), MenuAction::Detach),
+            ("detach".into(), MenuAction::Detach),
         ]
     }
 
@@ -1384,9 +1518,11 @@ impl App {
     }
 
     fn delete_folder(&mut self, id: u32) {
+        let now = Instant::now();
         for session in &mut self.sessions {
             if session.folder == Some(id) {
                 session.folder = None;
+                session.sync(now);
             }
         }
         self.folders.retain(|f| f.id != id);
@@ -1399,6 +1535,7 @@ impl App {
             return;
         };
         session.folder = folder;
+        session.sync(Instant::now());
         if let Some(f) = self.folders.iter_mut().find(|f| Some(f.id) == folder) {
             f.collapsed = false;
         }
@@ -1690,7 +1827,7 @@ impl App {
         let mut last_err = anyhow::anyhow!("no shell found");
         for shell in shells {
             let name = format!("{} {}", shell.label, self.next_id);
-            match self.spawn_session(name, shell.command(&cwd), place) {
+            match self.spawn_session(name, shell.launch(&cwd), place) {
                 Ok(id) => {
                     tracing::info!(id, shell = shell.label, "session started");
                     return;
@@ -1704,23 +1841,49 @@ impl App {
         self.status_msg = Some(format!("cannot start a shell: {last_err:#}"));
     }
 
-    /// Starts `cmd` in a new session of the cursor's team and shows it at `place`.
-    fn spawn_session(
-        &mut self,
-        name: String,
-        cmd: CommandBuilder,
-        place: Place,
-    ) -> anyhow::Result<u32> {
+    /// Starts `launch` in a new session of the cursor's team (in the daemon when there is one)
+    /// and shows it at `place`.
+    fn spawn_session(&mut self, name: String, launch: Launch, place: Place) -> anyhow::Result<u32> {
         let id = self.next_id;
         let (rows, cols) = ui::inner_size(self.main_area());
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
+        let mut session = match &self.link {
+            Some(link) => {
+                let info = SessionInfo {
+                    id,
+                    name: name.clone(),
+                    folder: None,
+                    ephemeral: false,
+                    rows,
+                    cols,
+                    age_ms: 0,
+                    exited: None,
+                    marks: MarksSnapshot::default(),
+                    agent: None,
+                };
+                // Registered before the spawn: its very first output has a screen to go to.
+                let session = Session::remote(&info, &[], link.clone(), Instant::now());
+                let launch_msg = ClientMsg::Spawn {
+                    id,
+                    name,
+                    launch,
+                    rows,
+                    cols,
+                };
+                link.send(&launch_msg)?;
+                session
+            }
+            None => {
+                let size = PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                };
+                Session::spawn(id, name, launch.to_command(), size, self.tx.clone())?
+            }
         };
-        let mut session = Session::spawn(id, name, cmd, size, self.tx.clone())?;
         session.folder = self.context_folder();
+        session.sync(Instant::now());
         self.sessions.push(session);
         self.next_id += 1;
         self.place(id, place);
@@ -1747,26 +1910,22 @@ impl App {
 }
 
 impl ShellSpec {
-    fn command(&self, cwd: &std::path::Path) -> CommandBuilder {
-        let mut cmd = match self.prog {
-            Some(prog) => {
-                let mut cmd = CommandBuilder::new(prog);
-                cmd.args(self.args);
-                if self.integrated {
-                    // After the user's profile: wraps their prompt, survives their settings.
-                    cmd.args([
-                        "-NoExit",
-                        "-EncodedCommand",
-                        &crate::shell::encoded_command(),
-                    ]);
-                }
-                cmd
-            }
-            None => CommandBuilder::new_default_prog(),
-        };
-        cmd.cwd(cwd);
-        cmd.env("TERM", "xterm-256color");
-        cmd
+    fn launch(&self, cwd: &Path) -> Launch {
+        let mut argv: Vec<String> = self
+            .prog
+            .into_iter()
+            .chain(self.args.iter().copied())
+            .map(String::from)
+            .collect();
+        if self.integrated {
+            // After the user's profile: wraps their prompt, survives their settings.
+            argv.extend([
+                "-NoExit".into(),
+                "-EncodedCommand".into(),
+                crate::shell::encoded_command(),
+            ]);
+        }
+        Launch::new(argv, cwd.to_path_buf())
     }
 }
 
@@ -1794,7 +1953,7 @@ fn claude_installed() -> bool {
 }
 
 /// A terminal editor for `path`: `edit` on Windows (else Notepad), `$EDITOR` or `nano` elsewhere.
-fn editor_command(path: &Path) -> CommandBuilder {
+fn editor_launch(path: &Path) -> Launch {
     let editor = if cfg!(windows) {
         if in_path("edit.exe") {
             "edit.exe".to_string()
@@ -1804,13 +1963,8 @@ fn editor_command(path: &Path) -> CommandBuilder {
     } else {
         std::env::var("EDITOR").unwrap_or_else(|_| "nano".into())
     };
-    let mut cmd = CommandBuilder::new(editor);
-    cmd.arg(path);
-    cmd.env("TERM", "xterm-256color");
-    if let Some(dir) = path.parent() {
-        cmd.cwd(dir);
-    }
-    cmd
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    Launch::new(vec![editor, path.display().to_string()], dir)
 }
 
 /// The line shown in a team box: the first one that is not empty nor a Markdown title.
@@ -2287,9 +2441,9 @@ mod tests {
     }
 
     #[test]
-    fn detach_is_greyed_out_until_the_daemon_exists() {
-        assert!(!MenuAction::Detach.enabled());
-        assert!(MenuAction::Bindings.enabled());
+    fn closing_everything_is_marked_destructive() {
+        assert!(MenuAction::QuitAll.destructive());
+        assert!(!MenuAction::Detach.destructive());
     }
 
     #[test]

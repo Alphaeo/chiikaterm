@@ -10,6 +10,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use crate::agent::{AgentInfo, AgentState};
 use crate::app::AppEvent;
+use crate::link::Link;
+use crate::protocol::{self, ClientMsg, SessionInfo};
 use crate::shell::{Finished, ShellMarks};
 
 /// Seconds of output history kept for the activity sparkline.
@@ -18,10 +20,29 @@ pub const ACTIVITY_SECS: usize = 8;
 /// A session counts as busy for this long after its last output.
 const BUSY_FOR: Duration = Duration::from_millis(600);
 
+/// The daemon's current client, to which every session forwards its output.
+pub type Tap = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Running,
     Exited(Option<u32>),
+}
+
+/// Where the program runs.
+enum Backend {
+    /// In this process (the daemon, or chiika without a daemon).
+    Local {
+        master: Option<Box<dyn MasterPty + Send>>,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        child: Box<dyn Child + Send + Sync>,
+    },
+    /// In the daemon: input and resizes go through the link, output comes from it.
+    Remote {
+        link: Link,
+        /// Exit reported by the daemon, not yet returned by `poll_exit`.
+        exit_pending: bool,
+    },
 }
 
 pub struct Session {
@@ -29,9 +50,7 @@ pub struct Session {
     pub name: String,
     pub parser: Arc<Mutex<vt100::Parser<ShellMarks>>>,
     pub status: Status,
-    master: Option<Box<dyn MasterPty + Send>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    child: Box<dyn Child + Send + Sync>,
+    backend: Backend,
     pub started: Instant,
     pub activity: Activity,
     /// Sidebar folder (= canvas team) holding this session.
@@ -93,6 +112,19 @@ impl Session {
         size: PtySize,
         tx: Sender<AppEvent>,
     ) -> anyhow::Result<Session> {
+        Session::spawn_tapped(id, name, cmd, size, tx, None)
+    }
+
+    /// Starts `cmd` in a new PTY. With a `tap` (in the daemon), the output is also sent to the
+    /// client, while the screen is locked so that a client attaching meanwhile gets it once.
+    pub fn spawn_tapped(
+        id: u32,
+        name: String,
+        cmd: CommandBuilder,
+        size: PtySize,
+        tx: Sender<AppEvent>,
+        tap: Option<Tap>,
+    ) -> anyhow::Result<Session> {
         let pair = native_pty_system().openpty(size)?;
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -129,6 +161,14 @@ impl Session {
                                     .write_all(reply.as_bytes())
                                     .and_then(|()| writer.flush());
                             }
+                            if let Some(tap) = &tap {
+                                let mut client = tap.lock().unwrap();
+                                if let Some(stream) = client.as_mut()
+                                    && protocol::write_data(stream, id, &buf[..n]).is_err()
+                                {
+                                    *client = None;
+                                }
+                            }
                             drop(parser);
                             let _ = tx.send(AppEvent::PtyOutput(id, n));
                         }
@@ -142,9 +182,11 @@ impl Session {
             name,
             parser,
             status: Status::Running,
-            master: Some(pair.master),
-            writer,
-            child,
+            backend: Backend::Local {
+                master: Some(pair.master),
+                writer,
+                child,
+            },
             started: Instant::now(),
             activity: Activity::default(),
             folder: None,
@@ -152,6 +194,82 @@ impl Session {
             agent: None,
             last_output: None,
         })
+    }
+
+    /// A session running in the daemon, shown from `screen` (as sent when attaching).
+    pub fn remote(info: &SessionInfo, screen: &[u8], link: Link, now: Instant) -> Session {
+        let marks = ShellMarks::from_snapshot(&info.marks, now);
+        let mut parser = vt100::Parser::new_with_callbacks(info.rows, info.cols, 1000, marks);
+        parser.process(screen);
+        let parser = Arc::new(Mutex::new(parser));
+        link.register(info.id, Arc::clone(&parser));
+        let age = Duration::from_millis(info.age_ms);
+        Session {
+            id: info.id,
+            name: info.name.clone(),
+            parser,
+            status: info.exited.map_or(Status::Running, Status::Exited),
+            backend: Backend::Remote {
+                link,
+                exit_pending: false,
+            },
+            started: now.checked_sub(age).unwrap_or(now),
+            activity: Activity::default(),
+            folder: info.folder,
+            ephemeral: info.ephemeral,
+            agent: info
+                .agent
+                .as_ref()
+                .map(|agent| AgentInfo::from_snapshot(agent, now)),
+            last_output: None,
+        }
+    }
+
+    /// What the daemon tells an attaching client about this session; `screen` is its locked
+    /// parser.
+    pub fn info(&self, screen: &vt100::Parser<ShellMarks>, now: Instant) -> SessionInfo {
+        let (rows, cols) = screen.screen().size();
+        SessionInfo {
+            id: self.id,
+            name: self.name.clone(),
+            folder: self.folder,
+            ephemeral: self.ephemeral,
+            rows,
+            cols,
+            age_ms: now.saturating_duration_since(self.started).as_millis() as u64,
+            exited: match self.status {
+                Status::Running => None,
+                Status::Exited(code) => Some(code),
+            },
+            marks: screen.callbacks().snapshot(now),
+            agent: self.agent.as_ref().map(|agent| agent.snapshot(now)),
+        }
+    }
+
+    /// The daemon reported that this remote session exited.
+    pub fn set_exited(&mut self, code: Option<u32>) {
+        if let Backend::Remote { exit_pending, .. } = &mut self.backend
+            && self.status == Status::Running
+        {
+            self.status = Status::Exited(code);
+            *exit_pending = true;
+        }
+    }
+
+    /// Tells the daemon what to keep about this session (name, team, agent…).
+    pub fn sync(&self, now: Instant) {
+        if let Backend::Remote { link, .. } = &self.backend {
+            let meta = ClientMsg::Meta {
+                id: self.id,
+                name: self.name.clone(),
+                folder: self.folder,
+                ephemeral: self.ephemeral,
+                agent: self.agent.as_ref().map(|agent| agent.snapshot(now)),
+            };
+            if let Err(e) = link.send(&meta) {
+                tracing::warn!(id = self.id, "cannot update the daemon: {e}");
+            }
+        }
     }
 
     pub fn record_output(&mut self, now: Instant, bytes: usize) {
@@ -210,9 +328,14 @@ impl Session {
 
     // ponytail: écriture synchrone, passer à un thread d'écriture par session si on observe des gels.
     pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut writer = self.writer.lock().unwrap();
-        writer.write_all(bytes)?;
-        writer.flush()
+        match &self.backend {
+            Backend::Local { writer, .. } => {
+                let mut writer = writer.lock().unwrap();
+                writer.write_all(bytes)?;
+                writer.flush()
+            }
+            Backend::Remote { link, .. } => link.input(self.id, bytes),
+        }
     }
 
     /// Current screen size (rows, cols).
@@ -221,13 +344,22 @@ impl Session {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> anyhow::Result<()> {
-        if let Some(master) = &self.master {
-            master.resize(PtySize {
+        match &self.backend {
+            Backend::Local {
+                master: Some(master),
+                ..
+            } => master.resize(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
-            })?;
+            })?,
+            Backend::Local { master: None, .. } => {}
+            Backend::Remote { link, .. } => link.send(&ClientMsg::Resize {
+                id: self.id,
+                rows,
+                cols,
+            })?,
         }
         self.parser
             .lock()
@@ -241,21 +373,31 @@ impl Session {
     /// an EOF when the process ends: dropping the master unblocks the reader thread.
     /// Returns true when the session has just exited.
     pub fn poll_exit(&mut self) -> bool {
-        if self.status != Status::Running {
-            return false;
+        match &mut self.backend {
+            Backend::Remote { exit_pending, .. } => std::mem::take(exit_pending),
+            Backend::Local { .. } if self.status != Status::Running => false,
+            Backend::Local { master, child, .. } => {
+                let Ok(Some(exit)) = child.try_wait() else {
+                    return false;
+                };
+                let code = exit.signal().is_none().then(|| exit.exit_code());
+                tracing::info!(id = self.id, ?code, "session exited");
+                self.status = Status::Exited(code);
+                *master = None;
+                true
+            }
         }
-        if let Ok(Some(exit)) = self.child.try_wait() {
-            let code = exit.signal().is_none().then(|| exit.exit_code());
-            tracing::info!(id = self.id, ?code, "session exited");
-            self.status = Status::Exited(code);
-            self.master = None;
-            return true;
-        }
-        false
     }
 
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        match &mut self.backend {
+            Backend::Local { child, .. } => {
+                let _ = child.kill();
+            }
+            Backend::Remote { link, .. } => {
+                let _ = link.send(&ClientMsg::Kill { id: self.id });
+            }
+        }
     }
 }
 

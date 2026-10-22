@@ -3,10 +3,13 @@ mod app;
 mod canvas;
 mod channel;
 mod config;
+mod daemon;
 mod fx;
 mod keys;
 mod layout;
+mod link;
 mod mascot;
+mod protocol;
 mod session;
 mod shell;
 mod theme;
@@ -42,7 +45,7 @@ fn usage() -> String {
             text += &format!("  {keys:<18}{what}\n");
         }
     }
-    text + "\nSessions are not persisted: quitting chiika kills every shell."
+    text + "\nShells run in a background daemon per project: detach with q, come back with chiika."
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,6 +55,12 @@ fn main() -> anyhow::Result<()> {
         [a] if a == "--version" || a == "-V" => {
             println!("chiika {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
+        }
+        // Started by chiika: hosts the project's sessions in the background.
+        [a] if a == "daemon" => {
+            init_logging(".daemon")?;
+            let data = std::env::current_dir()?.join(".chiika");
+            return daemon::run(&data);
         }
         // Run by the agents' Claude Code hooks: forward the hook to the chiika that started them.
         [a] if a == "hook" => {
@@ -72,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    init_logging()?;
+    init_logging("")?;
     tracing::info!("starting chiika {}", env!("CARGO_PKG_VERSION"));
 
     let mut terminal = ratatui::init();
@@ -95,7 +104,10 @@ fn main() -> anyhow::Result<()> {
         .and_then(|()| run(&mut terminal));
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
-    result
+    if let Ok(Some(note)) = &result {
+        eprintln!("{note}");
+    }
+    result.map(|_| ())
 }
 
 /// Sends the hook JSON read on stdin to the chiika channel. Silent and always successful: an
@@ -120,11 +132,12 @@ fn run_hook() {
     }
 }
 
-/// Logs go to the file named by `CHIIKA_LOG` only: stdout belongs to the TUI.
-fn init_logging() -> anyhow::Result<()> {
-    let Some(path) = std::env::var_os("CHIIKA_LOG") else {
+/// Logs go to the file named by `CHIIKA_LOG` (plus `suffix`) only: stdout belongs to the TUI.
+fn init_logging(suffix: &str) -> anyhow::Result<()> {
+    let Some(mut path) = std::env::var_os("CHIIKA_LOG") else {
         return Ok(());
     };
+    path.push(suffix);
     let file = File::create(&path).with_context(|| format!("creating log file {path:?}"))?;
     let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
@@ -138,7 +151,8 @@ fn init_logging() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+/// Runs the TUI; returns what to print once the terminal is restored.
+fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<Option<String>> {
     let (tx, rx) = mpsc::channel();
     let input_tx = tx.clone();
     thread::Builder::new()
@@ -182,6 +196,6 @@ fn run(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
             }
         }
     }
-    app.kill_all();
-    Ok(())
+    app.shutdown();
+    Ok(app.exit_note())
 }
