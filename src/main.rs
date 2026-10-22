@@ -1,6 +1,7 @@
 mod app;
 mod fx;
 mod keys;
+mod layout;
 mod session;
 mod theme;
 mod ui;
@@ -24,12 +25,19 @@ use tracing_subscriber::filter::LevelFilter;
 
 use crate::app::{App, AppEvent};
 
-const USAGE: &str = "Usage: chiika [--version | --help]
-Opens a terminal workspace with several shells.
-  Workspace: Enter focus · n new · N new (pick shell) · : or Ctrl+P palette · r rename · x close
-             j/k select · PgUp/PgDn scroll · q quit
-  Terminal:  Ctrl+Q back to workspace · Shift+PgUp/PgDn or mouse wheel scroll
-Sessions are not persisted: quitting chiika kills every shell.";
+/// `--help` text, built from the same table as the in-app bindings window.
+fn usage() -> String {
+    let mut text = String::from(
+        "Usage: chiika [--version | --help]\nOpens a terminal workspace with several shells.\n",
+    );
+    for (section, keys) in ui::BINDINGS {
+        text += &format!("\n{section}\n");
+        for (keys, what) in *keys {
+            text += &format!("  {keys:<18}{what}\n");
+        }
+    }
+    text + "\nSessions are not persisted: quitting chiika kills every shell."
+}
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,13 +48,14 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         [a] if a == "--help" || a == "-h" => {
-            println!("{USAGE}");
+            println!("{}", usage());
             return Ok(());
         }
         _ => {
             eprintln!(
-                "chiika: unexpected argument(s): {}\n\n{USAGE}",
-                args.join(" ")
+                "chiika: unexpected argument(s): {}\n\n{}",
+                args.join(" "),
+                usage()
             );
             std::process::exit(2);
         }

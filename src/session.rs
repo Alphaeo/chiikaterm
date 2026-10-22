@@ -32,6 +32,8 @@ pub struct Session {
     child: Box<dyn Child + Send + Sync>,
     pub started: Instant,
     pub activity: Activity,
+    /// Sidebar folder holding this session.
+    pub folder: Option<u32>,
     last_output: Option<Instant>,
 }
 
@@ -137,6 +139,7 @@ impl Session {
             child,
             started: Instant::now(),
             activity: Activity::default(),
+            folder: None,
             last_output: None,
         })
     }
@@ -167,6 +170,11 @@ impl Session {
         let mut writer = self.writer.lock().unwrap();
         writer.write_all(bytes)?;
         writer.flush()
+    }
+
+    /// Current screen size (rows, cols).
+    pub fn size(&self) -> (u16, u16) {
+        self.parser.lock().unwrap().screen().size()
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> anyhow::Result<()> {
