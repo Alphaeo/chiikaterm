@@ -1,0 +1,15 @@
+[package]
+name = "chiika"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+portable-pty = "0.9"
+ratatui = "0.30"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tui-term = "0.3"
+vt100 = "0.16"
