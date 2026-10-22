@@ -384,12 +384,25 @@ pub fn free_worktree_name(root: &Path, base: &str, n: u32) -> String {
 
 /// `.chiika/.gitignore` keeping the agents' files out of the project's git status.
 pub fn ensure_gitignore(data_dir: &Path) -> std::io::Result<()> {
+    const IGNORED: [&str; 3] = ["agents/", "bin/", "daemon.toml"];
     let path = data_dir.join(".gitignore");
-    if path.exists() {
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    let missing: Vec<&str> = IGNORED
+        .into_iter()
+        .filter(|line| !text.lines().any(|l| l.trim() == *line))
+        .collect();
+    if missing.is_empty() {
         return Ok(());
     }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for line in missing {
+        text.push_str(line);
+        text.push('\n');
+    }
     std::fs::create_dir_all(data_dir)?;
-    std::fs::write(path, "agents/\n")
+    std::fs::write(path, text)
 }
 
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -516,6 +529,18 @@ mod tests {
         assert_eq!(snapshot.since_ms, 3000);
         let restored = AgentInfo::from_snapshot(&snapshot, later);
         assert_eq!(restored.snapshot(later), snapshot);
+    }
+
+    #[test]
+    fn gitignore_gains_missing_lines_and_keeps_the_user_s() {
+        let dir = std::env::temp_dir().join(format!("chiika-ignore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), "agents/\nmine").unwrap();
+        ensure_gitignore(&dir).unwrap();
+        ensure_gitignore(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(text, "agents/\nmine\nbin/\ndaemon.toml\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

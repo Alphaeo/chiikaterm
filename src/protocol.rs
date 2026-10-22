@@ -157,6 +157,9 @@ pub enum DaemonMsg {
         sessions: Vec<SessionInfo>,
         /// Port and token of the hook channel, for the agents.
         hooks: Option<(u16, String)>,
+        /// Which build of chiika the daemon runs (empty for daemons older than this field).
+        #[serde(default)]
+        build: String,
     },
     SpawnFailed {
         id: u32,

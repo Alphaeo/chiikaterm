@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 
@@ -40,17 +40,46 @@ pub struct Attached {
     pub link: Link,
     pub sessions: Vec<(SessionInfo, Vec<u8>)>,
     pub hooks: Option<(u16, String)>,
+    /// The daemon's build (see `stable_copy`); empty for an older daemon.
+    pub build: String,
     /// Read side, handed to `Link::listen` once the sessions are registered.
     pub reader: TcpStream,
 }
 
-/// Connects to the daemon of the project whose data is in `data_dir`, starting it with
-/// `exe daemon` if none answers.
-pub fn attach(data_dir: &Path, exe: &Path) -> anyhow::Result<Attached> {
+/// A copy of `exe` in `.chiika/bin`, with its build id (size and modification time of `exe`).
+/// The daemon and the agents' tools run the copy, so the original stays free to be rebuilt or
+/// updated while they run.
+pub fn stable_copy(exe: &Path, data_dir: &Path) -> io::Result<(PathBuf, String)> {
+    let meta = std::fs::metadata(exe)?;
+    let modified = meta
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let build = format!("{:x}-{:x}", modified.as_secs(), meta.len());
+    let dir = data_dir.join("bin");
+    let copy = dir.join(format!("chiika-{build}{}", std::env::consts::EXE_SUFFIX));
+    if !copy.exists() {
+        std::fs::create_dir_all(&dir)?;
+        let partial = copy.with_extension("partial");
+        std::fs::copy(exe, &partial)?;
+        std::fs::rename(&partial, &copy)?;
+        // Copies still running (an older daemon, its agents' tools) are locked and stay.
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            if entry.path() != copy {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok((copy, build))
+}
+
+/// Connects to the daemon of the project whose data is in `data_dir`, starting `exe daemon`
+/// (marked as `build`) if none answers.
+pub fn attach(data_dir: &Path, exe: &Path, build: &str) -> anyhow::Result<Attached> {
     if let Ok(attached) = connect_runtime(data_dir) {
         return Ok(attached);
     }
-    start_daemon(exe, data_dir)?;
+    start_daemon(exe, data_dir, build)?;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         match connect_runtime(data_dir) {
@@ -79,7 +108,11 @@ pub fn connect(port: u16, token: &str) -> anyhow::Result<Attached> {
     };
     protocol::write_msg(&mut stream, &hello)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let Frame::Msg(DaemonMsg::Welcome { sessions, hooks }) = protocol::read_frame(&mut stream)?
+    let Frame::Msg(DaemonMsg::Welcome {
+        sessions,
+        hooks,
+        build,
+    }) = protocol::read_frame(&mut stream)?
     else {
         bail!("the daemon did not welcome this client");
     };
@@ -101,6 +134,7 @@ pub fn connect(port: u16, token: &str) -> anyhow::Result<Attached> {
         },
         sessions: screens,
         hooks,
+        build,
         reader,
     })
 }
@@ -175,11 +209,12 @@ impl Link {
 
 /// Starts `exe daemon` from the project folder, outside this terminal: it must survive the TUI
 /// and the window.
-fn start_daemon(exe: &Path, data_dir: &Path) -> anyhow::Result<()> {
+fn start_daemon(exe: &Path, data_dir: &Path, build: &str) -> anyhow::Result<()> {
     let root = data_dir.parent().context("no project folder")?;
     std::fs::create_dir_all(data_dir)?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
+        .env("CHIIKA_BUILD", build)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -207,4 +242,31 @@ fn spawn_detached(cmd: &mut std::process::Command) -> io::Result<std::process::C
 fn spawn_detached(cmd: &mut std::process::Command) -> io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     cmd.process_group(0).spawn()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_copy_follows_the_build_and_replaces_older_ones() {
+        let dir = std::env::temp_dir().join(format!("chiika-copy-{}", std::process::id()));
+        let data = dir.join(".chiika");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("chiika-original");
+        std::fs::write(&exe, b"build one").unwrap();
+        let (first, build) = stable_copy(&exe, &data).unwrap();
+        assert!(first.starts_with(data.join("bin")));
+        assert_eq!(std::fs::read(&first).unwrap(), b"build one");
+        assert_eq!(
+            stable_copy(&exe, &data).unwrap(),
+            (first.clone(), build.clone())
+        );
+        std::fs::write(&exe, b"build two, longer").unwrap();
+        let (second, other) = stable_copy(&exe, &data).unwrap();
+        assert_ne!(other, build);
+        assert_eq!(std::fs::read(&second).unwrap(), b"build two, longer");
+        assert!(!first.exists(), "the unused older copy is removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

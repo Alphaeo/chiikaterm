@@ -48,11 +48,13 @@ pub fn run(data_dir: &Path) -> anyhow::Result<()> {
     let file = runtime_file(data_dir);
     config::save(&file, &runtime)?;
     tracing::info!(port = runtime.port, "daemon started");
+    let build = std::env::var("CHIIKA_BUILD").unwrap_or_default();
     let result = serve(
         listener,
         &runtime.token,
         IDLE_EXIT,
         Some(data_dir.to_path_buf()),
+        &build,
     );
     // Only our own file: a newer daemon may have replaced it.
     let ours = std::fs::read_to_string(&file)
@@ -81,6 +83,7 @@ pub fn serve(
     token: &str,
     idle_exit: Duration,
     data_dir: Option<PathBuf>,
+    build: &str,
 ) -> anyhow::Result<()> {
     let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
     let (ctl_tx, ctl_rx) = mpsc::channel::<Control>();
@@ -150,7 +153,7 @@ pub fn serve(
                 };
                 generation += 1;
                 send(&tap, &DaemonMsg::Replaced);
-                attach(&tap, stream, &sessions, hooks.clone());
+                attach(&tap, stream, &sessions, hooks.clone(), build);
                 let gen_tx = ctl_tx.clone();
                 let current = generation;
                 thread::Builder::new()
@@ -294,7 +297,13 @@ fn handshake(stream: &TcpStream, token: &str) -> Option<TcpStream> {
 
 /// Sends the welcome and every screen, then makes `stream` the client. All screens stay locked
 /// meanwhile: output that follows a screen is sent after it, none is lost or doubled.
-fn attach(tap: &Tap, mut stream: TcpStream, sessions: &[Session], hooks: Option<(u16, String)>) {
+fn attach(
+    tap: &Tap,
+    mut stream: TcpStream,
+    sessions: &[Session],
+    hooks: Option<(u16, String)>,
+    build: &str,
+) {
     let now = Instant::now();
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -306,6 +315,7 @@ fn attach(tap: &Tap, mut stream: TcpStream, sessions: &[Session], hooks: Option<
             .map(|(s, screen)| s.info(screen, now))
             .collect(),
         hooks,
+        build: build.to_string(),
     };
     let mut tap = tap.lock().unwrap();
     let sent = protocol::write_msg(&mut stream, &welcome).and_then(|()| {
@@ -359,7 +369,7 @@ mod tests {
     fn start(idle_exit: Duration) -> (u16, thread::JoinHandle<anyhow::Result<()>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || serve(listener, "secret", idle_exit, None));
+        let server = thread::spawn(move || serve(listener, "secret", idle_exit, None, "b1"));
         (port, server)
     }
 
@@ -374,6 +384,7 @@ mod tests {
         let (port, server) = start(IDLE_EXIT);
         let first = link::connect(port, "secret").unwrap();
         assert!(first.sessions.is_empty());
+        assert_eq!(first.build, "b1");
         let info = SessionInfo {
             id: 1,
             name: "s".into(),

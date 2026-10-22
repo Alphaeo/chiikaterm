@@ -213,6 +213,9 @@ pub enum MenuAction {
     Detach,
     /// Leave and close every session.
     QuitAll,
+    /// Replace a daemon of another build (closing its sessions).
+    RestartDaemon,
+    KeepDaemon,
     SetTheme(usize),
     ToggleSidebar,
     EditConsigne(u32),
@@ -230,7 +233,10 @@ impl MenuAction {
     pub fn destructive(self) -> bool {
         matches!(
             self,
-            MenuAction::CloseSession(_) | MenuAction::DeleteFolder(_) | MenuAction::QuitAll
+            MenuAction::CloseSession(_)
+                | MenuAction::DeleteFolder(_)
+                | MenuAction::QuitAll
+                | MenuAction::RestartDaemon
         )
     }
 }
@@ -368,6 +374,10 @@ pub struct App {
     pub detach: bool,
     /// Printed once the terminal is restored.
     exit_note: Option<String>,
+    /// The chiika executable long-lived helpers run (a copy, see `link::stable_copy`).
+    tool_exe: Option<PathBuf>,
+    /// The daemon found runs another build of chiika and has sessions: ask what to do.
+    stale_daemon: bool,
     /// Without a daemon: permission requests held for the user's answer, by agent session.
     pending: HashMap<u32, (Reply, Instant)>,
     /// Messages between agents being drawn: from, to, when.
@@ -415,6 +425,8 @@ impl App {
             hooks: None,
             detach: false,
             exit_note: None,
+            tool_exe: None,
+            stale_daemon: false,
             pending: HashMap::new(),
             pulses: Vec::new(),
             rename: None,
@@ -424,7 +436,7 @@ impl App {
             area,
             tx,
         };
-        app.connect_daemon();
+        app.connect_daemon(true);
         if app.sessions.is_empty() {
             app.new_session(&available_shells(), Place::Replace);
         }
@@ -448,16 +460,78 @@ impl App {
             app.mode = Mode::Onboarding;
             app.picked = 0;
         }
+        if app.stale_daemon {
+            app.ask_restart();
+        }
         app
+    }
+
+    /// The daemon belongs to another build of chiika and has sessions: restart it or keep it.
+    fn ask_restart(&mut self) {
+        let count = self.sessions.len();
+        let items = vec![
+            (
+                format!("restart the daemon (closes its {count} sessions)"),
+                MenuAction::RestartDaemon,
+            ),
+            (
+                "keep it (older chiika, may misbehave)".into(),
+                MenuAction::KeepDaemon,
+            ),
+        ];
+        let at = Position::new(
+            (self.area.width / 2).saturating_sub(22),
+            (self.area.height / 2).saturating_sub(2),
+        );
+        self.open_menu(items, at);
+        self.status_msg = Some("the daemon runs another build of chiika".into());
+    }
+
+    /// Stops the daemon of another build and starts this one's (its sessions are closed).
+    fn restart_daemon(&mut self) {
+        if let Some(link) = self.link.take() {
+            let _ = link.send(&ClientMsg::Shutdown);
+            link.close();
+        }
+        self.sessions.clear();
+        self.layout = None;
+        self.focused = None;
+        self.cursor = 0;
+        self.stale_daemon = false;
+        // The old daemon removes its file when it stops.
+        if let Some(data) = &self.paths.project {
+            let file = crate::daemon::runtime_file(data);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while file.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        self.connect_daemon(false);
+        if self.sessions.is_empty() {
+            self.new_session(&available_shells(), Place::Replace);
+        }
+        if !self.sessions.is_empty() {
+            self.mode = Mode::Terminal;
+        }
     }
 
     /// Attaches to the project's daemon (starting it if needed) and shows its sessions. Without
     /// a daemon, sessions run inside chiika and end with it.
-    fn connect_daemon(&mut self) {
+    /// `allow_restart`: a daemon of another build with no session is replaced right away.
+    fn connect_daemon(&mut self, allow_restart: bool) {
         let (Some(data), Some(exe)) = (self.paths.project.clone(), self.paths.exe.clone()) else {
             return;
         };
-        let attached = match link::attach(&data, &exe) {
+        if let Err(e) = agent::ensure_gitignore(&data) {
+            tracing::warn!("cannot write .chiika/.gitignore: {e}");
+        }
+        // Long-lived processes run a copy: the build output stays free for `cargo build`.
+        let (exe, build) = link::stable_copy(&exe, &data).unwrap_or_else(|e| {
+            tracing::warn!("no copy of chiika for the daemon: {e}");
+            (exe, String::new())
+        });
+        self.tool_exe = Some(exe.clone());
+        let attached = match link::attach(&data, &exe, &build) {
             Ok(attached) => attached,
             Err(e) => {
                 tracing::warn!("no daemon: {e:#}");
@@ -471,9 +545,22 @@ impl App {
             self.sessions.push(session);
         }
         self.next_id = self.sessions.iter().map(|s| s.id + 1).max().unwrap_or(1);
+        let stale = attached.build != build;
         attached.link.listen(attached.reader, self.tx.clone());
         self.hooks = attached.hooks;
         self.link = Some(attached.link);
+        if stale {
+            tracing::info!(
+                daemon = attached.build,
+                ours = build,
+                "daemon of another build"
+            );
+            if self.sessions.is_empty() && allow_restart {
+                self.restart_daemon();
+                return;
+            }
+            self.stale_daemon = true;
+        }
         // One pane, on a shell rather than an agent (agents live in their team boxes).
         let first = self
             .sessions
@@ -1186,6 +1273,8 @@ impl App {
                 self.should_quit = true;
             }
             MenuAction::Detach => self.status_msg = Some(NO_DAEMON.into()),
+            MenuAction::RestartDaemon => self.restart_daemon(),
+            MenuAction::KeepDaemon => {}
             MenuAction::QuitAll => {
                 self.detach = false;
                 self.should_quit = true;
@@ -1235,7 +1324,7 @@ impl App {
         };
         let (Some(data), Some(exe), Some((port, token))) = (
             self.paths.project.clone(),
-            self.paths.exe.clone(),
+            self.tool_exe.clone().or_else(|| self.paths.exe.clone()),
             self.hooks.clone(),
         ) else {
             self.status_msg = Some("agents need a project folder and the chiika channel".into());
