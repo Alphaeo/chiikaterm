@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -10,8 +11,9 @@ use ratatui::layout::{Position, Rect};
 
 use crate::agent::{self, AgentInfo, AgentState};
 use crate::canvas::{self, CanvasState};
-use crate::channel::{self, HookEvent};
+use crate::channel::{self, HookEvent, Reply, Request};
 use crate::config::{self, AgentChoice, CanvasFile, Config, TeamEntry};
+use crate::coord;
 use crate::fx::{format_duration, fuzzy_match};
 use crate::keys::{encode_key, encode_paste};
 use crate::layout::{Dir, Layout, Split};
@@ -65,6 +67,11 @@ pub enum AppEvent {
     SpawnFailed(u32, String),
     /// The connection to the daemon ended, with the reason.
     DaemonGone(String),
+    /// A hook or a tool call on chiika's own channel (no daemon), with its reply when the
+    /// sender waits for one.
+    Channel(u32, Request, Option<Reply>),
+    /// Agent `from` sent a message to agent `to`.
+    Pulse(u32, u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +216,7 @@ pub enum MenuAction {
     SetTheme(usize),
     ToggleSidebar,
     EditConsigne(u32),
+    OpenBoard(u32),
     /// New team at this canvas position.
     NewTeamAt(i32, i32),
     ToggleClaude,
@@ -360,6 +368,10 @@ pub struct App {
     pub detach: bool,
     /// Printed once the terminal is restored.
     exit_note: Option<String>,
+    /// Without a daemon: permission requests held for the user's answer, by agent session.
+    pending: HashMap<u32, (Reply, Instant)>,
+    /// Messages between agents being drawn: from, to, when.
+    pub pulses: Vec<(u32, u32, Instant)>,
     rename: Option<Target>,
     next_folder: u32,
     last_click: Option<(Instant, usize)>,
@@ -403,6 +415,8 @@ impl App {
             hooks: None,
             detach: false,
             exit_note: None,
+            pending: HashMap::new(),
+            pulses: Vec::new(),
             rename: None,
             next_folder: 1,
             last_click: None,
@@ -602,17 +616,32 @@ impl App {
 
     /// Opens the team's `TEAM.md` (created from a template) in an editor pane.
     fn edit_consigne(&mut self, id: u32) {
-        let Some(path) = self.paths.team_file(id) else {
-            self.status_msg = Some("no project folder to keep the instructions in".into());
+        let template = "Instructions for this team: its goal, its rules, its priorities.";
+        self.open_team_file(id, self.paths.team_file(id), template);
+    }
+
+    /// Opens the team's shared board, where its agents `post`.
+    fn open_board(&mut self, id: u32) {
+        let board = self
+            .paths
+            .project
+            .as_deref()
+            .map(|data| coord::board_file(data, id));
+        self.open_team_file(id, board, "Notes posted by the team's agents.");
+    }
+
+    /// Opens a team file (created with a title and `template`) in an editor pane that closes
+    /// with the editor.
+    fn open_team_file(&mut self, id: u32, path: Option<PathBuf>, template: &str) {
+        let Some(path) = path else {
+            self.status_msg = Some("no project folder to keep team files in".into());
             return;
         };
         let team = self
             .folder(id)
             .map_or_else(|| "team".to_string(), |f| f.name.clone());
         if !path.exists() {
-            let template = format!(
-                "# {team}\n\nInstructions for this team: its goal, its rules, its priorities.\n"
-            );
+            let template = format!("# {team}\n\n{template}\n");
             let written = path
                 .parent()
                 .map_or(Ok(()), std::fs::create_dir_all)
@@ -685,6 +714,8 @@ impl App {
             }
             AppEvent::PtyClosed(id) => tracing::debug!(id, "pty reader closed"),
             AppEvent::Hook(id, event) => self.on_hook(id, &event),
+            AppEvent::Channel(id, request, reply) => self.on_channel(id, request, reply),
+            AppEvent::Pulse(from, to) => self.pulses.push((from, to, Instant::now())),
             AppEvent::RemoteExited(id, code) => {
                 if let Some(session) = self.session_mut(id) {
                     session.set_exited(code);
@@ -773,6 +804,10 @@ impl App {
             self.reload_consignes();
             self.set_view(View::Canvas);
         }
+        self.pending
+            .retain(|_, (_, since)| now.saturating_duration_since(*since) < agent::PERMISSION_WAIT);
+        self.pulses
+            .retain(|&(_, _, at)| now.saturating_duration_since(at) < canvas::PULSE);
         if now.saturating_duration_since(self.consigne_checked) > CONSIGNE_RELOAD {
             self.reload_consignes();
             self.consigne_checked = now;
@@ -789,7 +824,7 @@ impl App {
             let age = now.saturating_duration_since(t.born);
             age < TOAST_SLIDE || age > TOAST_LIFE - TOAST_FADE
         });
-        if switching || toast_moving || self.canvas.animating(now) {
+        if switching || toast_moving || self.canvas.animating(now) || !self.pulses.is_empty() {
             Duration::from_millis(16)
         } else if self
             .sessions
@@ -1158,6 +1193,7 @@ impl App {
             MenuAction::SetTheme(index) => self.theme = index,
             MenuAction::ToggleSidebar => self.toggle_sidebar(),
             MenuAction::EditConsigne(id) => self.edit_consigne(id),
+            MenuAction::OpenBoard(id) => self.open_board(id),
             MenuAction::NewTeamAt(x, y) => {
                 let id = self.new_folder();
                 if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
@@ -1250,10 +1286,12 @@ impl App {
             .join("agents")
             .join(format!("agent-{id}"))
             .join("settings.json");
+        let mcp = settings.with_file_name("mcp.json");
         let written = settings
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&settings, agent::hook_settings(&exe)));
+            .and_then(|()| std::fs::write(&settings, agent::hook_settings(&exe)))
+            .and_then(|()| std::fs::write(&mcp, agent::mcp_config(&exe, port, &token, id)));
         if let Err(e) = written {
             self.status_msg = Some(format!("cannot write {}: {e}", settings.display()));
             return;
@@ -1262,6 +1300,8 @@ impl App {
             claude.display().to_string(),
             "--settings".into(),
             settings.display().to_string(),
+            "--mcp-config".into(),
+            mcp.display().to_string(),
             "--append-system-prompt".into(),
             prompt,
         ];
@@ -1332,6 +1372,51 @@ impl App {
         self.mode = Mode::Terminal;
     }
 
+    /// Answers the permission request of agent `id`: allow, deny, or `None` to let it ask in its
+    /// terminal.
+    pub(crate) fn decide(&mut self, id: u32, allow: Option<bool>) {
+        if let Some(agent) = self.session_mut(id).and_then(|s| s.agent.as_mut()) {
+            agent.permission = None;
+        }
+        match &self.link {
+            Some(link) => {
+                if let Err(e) = link.send(&ClientMsg::Decide { id, allow }) {
+                    self.status_msg = Some(format!("cannot answer the agent: {e}"));
+                }
+            }
+            None => {
+                if let Some((reply, _)) = self.pending.remove(&id)
+                    && let Some(allow) = allow
+                {
+                    reply.send(&agent::decision(allow));
+                }
+            }
+        }
+    }
+
+    /// Without a daemon: hooks and tool calls arrive on chiika's own channel.
+    fn on_channel(&mut self, id: u32, request: Request, reply: Option<Reply>) {
+        match request {
+            Request::Hook(event) => {
+                self.on_hook(id, &event);
+                if let Some(reply) = reply {
+                    self.pending.insert(id, (reply, Instant::now()));
+                }
+            }
+            Request::Tool { name, arguments } => {
+                let data = self.paths.project.clone();
+                let outcome =
+                    coord::run(&mut self.sessions, data.as_deref(), id, &name, &arguments);
+                if let Some(reply) = reply {
+                    reply.send(&outcome.to_mcp());
+                }
+                if let Some((from, to)) = outcome.link {
+                    self.pulses.push((from, to, Instant::now()));
+                }
+            }
+        }
+    }
+
     pub(crate) fn agent_interrupt(&mut self, id: u32) {
         self.send_to(id, b"\x1b");
     }
@@ -1396,6 +1481,7 @@ impl App {
             ("add agent…".into(), MenuAction::AgentRoles(id)),
             ("rename".into(), MenuAction::Rename(Target::Folder(id))),
             ("edit instructions".into(), MenuAction::EditConsigne(id)),
+            ("open board".into(), MenuAction::OpenBoard(id)),
             ("delete team".into(), MenuAction::DeleteFolder(id)),
         ]
     }

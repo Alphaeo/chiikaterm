@@ -26,6 +26,8 @@ const TRAY_H: u16 = 7;
 const TEAM_STEP: (i32, i32) = (44, 18);
 /// A dropped mascot flies to its place for this long.
 pub const FLIGHT: Duration = Duration::from_millis(280);
+/// A message between agents is drawn for this long.
+pub const PULSE: Duration = Duration::from_millis(1200);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// A rectangle in screen cells that may stick out of the screen.
@@ -358,7 +360,18 @@ impl App {
             && let Some(inspector) = inspector_layout(self.main_area())
             && inspector.panel.contains(pos)
         {
-            if inspector.open.contains(pos) {
+            let can_decide = self
+                .session(id)
+                .and_then(|s| s.agent.as_ref())
+                .is_some_and(|a| a.can_decide(Instant::now()));
+            if can_decide && inspector.allow.contains(pos) {
+                self.decide(id, Some(true));
+            } else if can_decide && inspector.deny.contains(pos) {
+                self.decide(id, Some(false));
+            } else if can_decide && inspector.in_terminal.contains(pos) {
+                self.decide(id, None);
+                self.agent_open(id);
+            } else if inspector.open.contains(pos) {
                 self.agent_open(id);
             } else if inspector.interrupt.contains(pos) {
                 self.agent_interrupt(id);
@@ -698,6 +711,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
         Style::new().fg(theme.accents[0]).bold(),
     );
 
+    draw_pulses(buf, app, &layout, now);
+
     if let Some(id) = app.inspected()
         && let Some(inspector) = inspector_layout(area)
         && let Some(session) = app.session(id)
@@ -801,6 +816,10 @@ pub struct Inspector {
     pub open: Rect,
     pub interrupt: Rect,
     pub resend: Rect,
+    /// Answers to a permission request (shown only while one is held).
+    pub allow: Rect,
+    pub deny: Rect,
+    pub in_terminal: Rect,
 }
 
 const INSPECTOR_W: u16 = 40;
@@ -818,11 +837,15 @@ pub fn inspector_layout(area: Rect) -> Option<Inspector> {
         INSPECTOR_H,
     );
     let y = panel.bottom() - 2;
+    let answers = y - 1;
     Some(Inspector {
         panel,
         open: Rect::new(panel.x + 2, y, 8, 1),
         interrupt: Rect::new(panel.x + 12, y, 13, 1),
         resend: Rect::new(panel.x + 27, y, 10, 1),
+        allow: Rect::new(panel.x + 2, answers, 9, 1),
+        deny: Rect::new(panel.x + 13, answers, 8, 1),
+        in_terminal: Rect::new(panel.x + 23, answers, 15, 1),
     })
 }
 
@@ -926,6 +949,27 @@ fn draw_inspector(
             Style::new().fg(theme.text).add_modifier(Modifier::ITALIC),
         );
     }
+    if agent.can_decide(now) {
+        let answer = |color| Style::new().fg(theme.on_pill).bg(color).bold();
+        for (rect, label, style) in [
+            (inspector.allow, "[ allow ]", answer(theme.ok)),
+            (inspector.deny, "[ deny ]", answer(theme.err)),
+            (
+                inspector.in_terminal,
+                "[ in terminal ]",
+                answer(theme.muted),
+            ),
+        ] {
+            put(
+                buf,
+                panel,
+                i32::from(rect.x),
+                i32::from(rect.y),
+                label,
+                style,
+            );
+        }
+    }
     let button = Style::new().fg(theme.on_pill).bg(theme.pill[0]).bold();
     for (rect, label) in [
         (inspector.open, "[ open ]"),
@@ -940,6 +984,64 @@ fn draw_inspector(
             label,
             button,
         );
+    }
+}
+
+/// The cells of a straight line from `a` to `b`, both included (Bresenham).
+pub fn line(a: (i32, i32), b: (i32, i32)) -> Vec<(i32, i32)> {
+    let (dx, dy) = ((b.0 - a.0).abs(), -(b.1 - a.1).abs());
+    let (sx, sy) = ((b.0 - a.0).signum(), (b.1 - a.1).signum());
+    let (mut x, mut y, mut err) = (a.0, a.1, dx + dy);
+    let mut cells = vec![(x, y)];
+    while (x, y) != b {
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+        cells.push((x, y));
+    }
+    cells
+}
+
+/// Messages between agents: a dotted line between the two mascots, with a dot travelling from
+/// the sender to the receiver.
+fn draw_pulses(buf: &mut Buffer, app: &App, layout: &CanvasLayout, now: Instant) {
+    let theme = app.theme();
+    let center = |(x, y): (i32, i32)| (x + mascot::WIDTH as i32 / 2, y + 2);
+    let slots: Vec<IRect> = layout
+        .boxes
+        .iter()
+        .flat_map(|team| &team.slots)
+        .chain(&layout.tray_slots)
+        .map(|&(_, slot)| slot_rect(slot))
+        .collect();
+    for &(from, to, started) in &app.pulses {
+        let (Some(a), Some(b)) = (layout.slot_of(from), layout.slot_of(to)) else {
+            continue;
+        };
+        let cells = line(center(a), center(b));
+        let t = now.saturating_duration_since(started).as_secs_f32() / PULSE.as_secs_f32();
+        let head = ((cells.len() - 1) as f32 * t.min(1.0)).round() as usize;
+        let color = theme.accent(from);
+        for (i, &(x, y)) in cells.iter().enumerate() {
+            let on_mascot = slots
+                .iter()
+                .any(|slot| slot.contains(Position::new(x.max(0) as u16, y.max(0) as u16)));
+            if on_mascot {
+                continue;
+            }
+            let (symbol, style) = match head.abs_diff(i) {
+                0 => ("●", Style::new().fg(color).bold()),
+                1 => ("•", Style::new().fg(color)),
+                _ => ("·", Style::new().fg(theme.border)),
+            };
+            put(buf, layout.board, x, y, symbol, style);
+        }
     }
 }
 
@@ -1005,6 +1107,18 @@ mod tests {
         assert!(inspector.panel.contains(inspector.resend.as_position()));
         assert!(inspector.open.right() <= inspector.interrupt.x);
         assert!(inspector_layout(Rect::new(0, 0, 50, 40)).is_none());
+    }
+
+    #[test]
+    fn lines_join_both_ends() {
+        assert_eq!(line((0, 0), (3, 0)), [(0, 0), (1, 0), (2, 0), (3, 0)]);
+        assert_eq!(line((2, 2), (0, 0)), [(2, 2), (1, 1), (0, 0)]);
+        assert_eq!(line((1, 1), (1, 1)), [(1, 1)]);
+        let steep = line((0, 0), (1, 5));
+        assert_eq!(
+            (steep[0], steep[steep.len() - 1], steep.len()),
+            ((0, 0), (1, 5), 6)
+        );
     }
 
     #[test]

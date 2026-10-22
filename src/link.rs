@@ -131,6 +131,7 @@ impl Link {
                         Ok(Frame::Msg(DaemonMsg::Replaced)) => {
                             AppEvent::DaemonGone("chiika was opened in another window".into())
                         }
+                        Ok(Frame::Msg(DaemonMsg::Pulse { from, to })) => AppEvent::Pulse(from, to),
                         Ok(Frame::Msg(DaemonMsg::Welcome { .. })) => continue,
                         Err(_) => {
                             AppEvent::DaemonGone("the connection to the daemon was lost".into())

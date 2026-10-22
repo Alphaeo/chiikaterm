@@ -50,6 +50,9 @@ pub const HOOKS: [&str; 7] = [
 /// before any hook runs (trusting a folder, logging in…).
 const SILENT_START: Duration = Duration::from_secs(6);
 const FILES_KEPT: usize = 6;
+
+/// A permission request waits this long for an answer from chiika, then goes to the terminal.
+pub const PERMISSION_WAIT: Duration = Duration::from_secs(120);
 const MESSAGE_KEPT: usize = 400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -80,6 +83,8 @@ pub struct AgentInfo {
     pub message: Option<String>,
     /// Files it edited, most recent last.
     pub files: Vec<String>,
+    /// Since when chiika holds its permission request, waiting for the user's answer.
+    pub permission: Option<Instant>,
 }
 
 impl AgentInfo {
@@ -93,6 +98,7 @@ impl AgentInfo {
             tool: None,
             message: None,
             files: Vec::new(),
+            permission: None,
         }
     }
 
@@ -107,6 +113,9 @@ impl AgentInfo {
             tool: self.tool.clone(),
             message: self.message.clone(),
             files: self.files.clone(),
+            permission_ms: self
+                .permission
+                .map(|t| now.saturating_duration_since(t).as_millis() as u64),
         }
     }
 
@@ -121,12 +130,17 @@ impl AgentInfo {
             tool: snapshot.tool.clone(),
             message: snapshot.message.clone(),
             files: snapshot.files.clone(),
+            permission: snapshot
+                .permission_ms
+                .and_then(|ms| now.checked_sub(Duration::from_millis(ms))),
         }
     }
 
     /// Follows a hook; returns the new state when it changed.
     pub fn apply(&mut self, event: &HookEvent, now: Instant) -> Option<AgentState> {
         let before = self.state;
+        // Any later hook means the request was answered (here or in the terminal).
+        self.permission = None;
         if let Some(cwd) = &event.cwd {
             self.folder = PathBuf::from(cwd);
         }
@@ -149,6 +163,7 @@ impl AgentInfo {
             }
             "PermissionRequest" => {
                 self.state = AgentState::Waiting;
+                self.permission = Some(now);
                 let tool = event.tool.as_deref().unwrap_or("a tool");
                 self.message = Some(format!("asks permission to use {tool}"));
             }
@@ -172,6 +187,12 @@ impl AgentInfo {
             self.since = now;
             self.state
         })
+    }
+
+    /// chiika can still answer its permission request.
+    pub fn can_decide(&self, now: Instant) -> bool {
+        self.permission
+            .is_some_and(|t| now.saturating_duration_since(t) < PERMISSION_WAIT)
     }
 
     /// The state to show: a silent start is shown as waiting for the user.
@@ -239,24 +260,72 @@ pub fn system_prompt(
         None => format!("You work in the project folder {}.", folder.display()),
     };
     format!(
-        "You are an agent run by chiika, in the team \"{team}\".\n{duty}\n{place}\n\n\
-         Team instructions:\n{}",
+        "You are an agent run by chiika, in the team \"{team}\".\n{duty}\n{place}\n\
+         Work with your team through the chiika tools: `team` (who is there), `send_to` (message \
+         another agent), `read_screen` (follow a member's terminal), `post` and `board` (the \
+         team's shared board).\n\nTeam instructions:\n{}",
         instructions.trim()
     )
+}
+
+/// What `chiika hook` prints to answer a permission request.
+pub fn decision(allow: bool) -> Vec<u8> {
+    let decision = if allow {
+        serde_json::json!({ "behavior": "allow" })
+    } else {
+        serde_json::json!({ "behavior": "deny", "message": "Denied by the user in chiika." })
+    };
+    serde_json::json!({
+        "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": decision }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// `--mcp-config` content: the chiika tools, served by `<exe> mcp` for this session.
+pub fn mcp_config(exe: &Path, port: u16, token: &str, session: u32) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "chiika": {
+                "type": "stdio",
+                "command": exe.display().to_string(),
+                "args": ["mcp"],
+                "env": {
+                    "CHIIKA_PORT": port.to_string(),
+                    "CHIIKA_TOKEN": token,
+                    "CHIIKA_SESSION": session.to_string(),
+                },
+            }
+        }
+    })
+    .to_string()
 }
 
 /// Claude Code settings that run `<exe> hook` on every hook chiika listens to.
 pub fn hook_settings(exe: &Path) -> String {
     // Claude runs hook commands with a POSIX shell (Git Bash on Windows): forward slashes.
     let command = format!("\"{}\" hook", exe.display().to_string().replace('\\', "/"));
-    let entry = serde_json::json!([{
-        "hooks": [{ "type": "command", "command": command, "timeout": 5 }]
-    }]);
     let hooks: serde_json::Map<String, serde_json::Value> = HOOKS
         .iter()
-        .map(|name| (name.to_string(), entry.clone()))
+        .map(|&name| {
+            // A permission request waits for the user's answer in chiika.
+            let timeout = if name == "PermissionRequest" {
+                PERMISSION_WAIT.as_secs() + 10
+            } else {
+                5
+            };
+            let entry = serde_json::json!([{
+                "hooks": [{ "type": "command", "command": command, "timeout": timeout }]
+            }]);
+            (name.to_string(), entry)
+        })
         .collect();
-    serde_json::json!({ "hooks": hooks }).to_string()
+    serde_json::json!({
+        "hooks": hooks,
+        // The chiika tools never ask for permission.
+        "permissions": { "allow": ["mcp__chiika"] },
+    })
+    .to_string()
 }
 
 /// Claude Code's executable. The npm install has `claude.cmd` next to `node_modules` holding the
@@ -500,6 +569,36 @@ mod tests {
             let command = &value["hooks"][name][0]["hooks"][0]["command"];
             assert_eq!(command, "\"C:/bin/chiika.exe\" hook");
         }
+        assert_eq!(value["permissions"]["allow"][0], "mcp__chiika");
+        let permission = &value["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"];
+        assert!(permission.as_u64().unwrap() > PERMISSION_WAIT.as_secs());
+    }
+
+    #[test]
+    fn decisions_and_mcp_config_match_what_claude_reads() {
+        let allow: serde_json::Value = serde_json::from_slice(&decision(true)).unwrap();
+        let output = &allow["hookSpecificOutput"];
+        assert_eq!(output["hookEventName"], "PermissionRequest");
+        assert_eq!(output["decision"]["behavior"], "allow");
+        let deny: serde_json::Value = serde_json::from_slice(&decision(false)).unwrap();
+        assert_eq!(deny["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        let config = mcp_config(Path::new("C:\\bin\\chiika.exe"), 4242, "tok", 7);
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        let server = &config["mcpServers"]["chiika"];
+        assert_eq!(server["args"][0], "mcp");
+        assert_eq!(server["env"]["CHIIKA_PORT"], "4242");
+        assert_eq!(server["env"]["CHIIKA_SESSION"], "7");
+    }
+
+    #[test]
+    fn a_permission_request_is_held_until_another_hook() {
+        let now = Instant::now();
+        let mut a = agent(now);
+        a.apply(&hook("PermissionRequest"), now);
+        assert!(a.can_decide(now));
+        assert!(!a.can_decide(now + PERMISSION_WAIT));
+        a.apply(&hook("PostToolUse"), now);
+        assert!(!a.can_decide(now));
     }
 
     #[test]

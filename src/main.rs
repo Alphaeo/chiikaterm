@@ -3,12 +3,14 @@ mod app;
 mod canvas;
 mod channel;
 mod config;
+mod coord;
 mod daemon;
 mod fx;
 mod keys;
 mod layout;
 mod link;
 mod mascot;
+mod mcp;
 mod protocol;
 mod session;
 mod shell;
@@ -19,7 +21,7 @@ use std::fs::File;
 use std::io::stdout;
 use std::sync::{Mutex, mpsc};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use ratatui::DefaultTerminal;
@@ -61,6 +63,11 @@ fn main() -> anyhow::Result<()> {
             init_logging(".daemon")?;
             let data = std::env::current_dir()?.join(".chiika");
             return daemon::run(&data);
+        }
+        // Started by Claude Code for each agent: its chiika tools (MCP over stdio).
+        [a] if a == "mcp" => {
+            init_logging(".mcp")?;
+            return mcp::run();
         }
         // Run by the agents' Claude Code hooks: forward the hook to the chiika that started them.
         [a] if a == "hook" => {
@@ -110,8 +117,9 @@ fn main() -> anyhow::Result<()> {
     result.map(|_| ())
 }
 
-/// Sends the hook JSON read on stdin to the chiika channel. Silent and always successful: an
-/// agent must never be blocked or disturbed because chiika is gone.
+/// Sends the hook JSON read on stdin to the chiika channel and prints chiika's answer (the
+/// user's decision on a permission request). Always successful: an agent must never be blocked
+/// or disturbed because chiika is gone.
 fn run_hook() {
     use std::io::Read;
     let var = |name: &str| std::env::var(name).ok();
@@ -128,7 +136,18 @@ fn run_hook() {
         .read_to_end(&mut input)
         .is_ok()
     {
-        let _ = channel::send(port, &token, &session, &input);
+        let permission = channel::parse_hook(&input).is_some_and(|e| e.name == "PermissionRequest");
+        let wait = if permission {
+            agent::PERMISSION_WAIT + Duration::from_secs(5)
+        } else {
+            Duration::from_secs(2)
+        };
+        if let Ok(answer) = channel::request(port, &token, &session, &input, wait)
+            && !answer.is_empty()
+        {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&answer);
+        }
     }
 }
 

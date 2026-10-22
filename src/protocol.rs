@@ -139,6 +139,12 @@ pub enum ClientMsg {
         ephemeral: bool,
         agent: Option<AgentSnapshot>,
     },
+    /// Answer the permission request held for agent `id`: allow, deny, or `None` to let the
+    /// agent ask in its terminal.
+    Decide {
+        id: u32,
+        allow: Option<bool>,
+    },
     /// Kill every session and stop the daemon.
     Shutdown,
 }
@@ -166,6 +172,11 @@ pub enum DaemonMsg {
     },
     /// Another client attached: this one is detached.
     Replaced,
+    /// Agent `from` sent a message to agent `to`.
+    Pulse {
+        from: u32,
+        to: u32,
+    },
 }
 
 /// A session as the daemon describes it to an attaching client.
@@ -214,6 +225,8 @@ pub struct AgentSnapshot {
     pub tool: Option<String>,
     pub message: Option<String>,
     pub files: Vec<String>,
+    /// How long chiika has held its permission request, if it does.
+    pub permission_ms: Option<u64>,
 }
 
 #[cfg(test)]

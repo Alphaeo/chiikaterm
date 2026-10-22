@@ -1056,11 +1056,16 @@ mod tests {
         );
         agent.state = AgentState::Waiting;
         agent.message = Some("asks permission to use Bash".into());
+        agent.permission = Some(Instant::now());
         let agent_id = app.sessions[1].id;
         app.sessions[1].agent = Some(agent);
         app.sessions[1].folder = Some(team);
         app.select_row(Row::Session(agent_id));
         assert_eq!(app.inspected(), Some(agent_id));
+
+        // A message travelling between two mascots.
+        app.pulses
+            .push((agent_id, app.sessions[2].id, Instant::now()));
 
         // A mascot being dragged over the canvas.
         let dragged = app.sessions[0].id;

@@ -12,10 +12,13 @@ use std::time::{Duration, Instant};
 use portable_pty::PtySize;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::AgentInfo;
+use std::collections::HashMap;
+
+use crate::agent::{self, AgentInfo};
 use crate::app::AppEvent;
-use crate::channel;
+use crate::channel::{self, Reply, Request};
 use crate::config;
+use crate::coord;
 use crate::protocol::{self, ClientMsg, DaemonMsg, Frame};
 use crate::session::{Session, Status, Tap};
 
@@ -45,7 +48,12 @@ pub fn run(data_dir: &Path) -> anyhow::Result<()> {
     let file = runtime_file(data_dir);
     config::save(&file, &runtime)?;
     tracing::info!(port = runtime.port, "daemon started");
-    let result = serve(listener, &runtime.token, IDLE_EXIT);
+    let result = serve(
+        listener,
+        &runtime.token,
+        IDLE_EXIT,
+        Some(data_dir.to_path_buf()),
+    );
     // Only our own file: a newer daemon may have replaced it.
     let ours = std::fs::read_to_string(&file)
         .ok()
@@ -67,7 +75,13 @@ enum Control {
 }
 
 /// The daemon loop: sessions, hooks, and one client at a time (the newest replaces the others).
-pub fn serve(listener: TcpListener, token: &str, idle_exit: Duration) -> anyhow::Result<()> {
+/// `data_dir` is the project's `.chiika` folder (team boards).
+pub fn serve(
+    listener: TcpListener,
+    token: &str,
+    idle_exit: Duration,
+    data_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
     let (ctl_tx, ctl_rx) = mpsc::channel::<Control>();
     let hooks = channel::start(app_tx.clone())
@@ -87,23 +101,48 @@ pub fn serve(listener: TcpListener, token: &str, idle_exit: Duration) -> anyhow:
 
     let tap: Tap = Arc::new(Mutex::new(None));
     let mut sessions: Vec<Session> = Vec::new();
+    // Permission requests held for the user's answer, by agent session.
+    let mut pending: HashMap<u32, (Reply, Instant)> = HashMap::new();
     let mut client: Option<u64> = None;
     let mut generation = 0;
     let mut had_client = false;
     let started = Instant::now();
     loop {
         while let Ok(event) = app_rx.try_recv() {
-            if let AppEvent::Hook(id, event) = event {
-                let agent = sessions
-                    .iter_mut()
-                    .find(|s| s.id == id)
-                    .and_then(|s| s.agent.as_mut());
-                if let Some(agent) = agent {
-                    agent.apply(&event, Instant::now());
+            let AppEvent::Channel(id, request, reply) = event else {
+                continue;
+            };
+            match request {
+                Request::Hook(event) => {
+                    let agent = sessions
+                        .iter_mut()
+                        .find(|s| s.id == id)
+                        .and_then(|s| s.agent.as_mut());
+                    if let Some(agent) = agent {
+                        agent.apply(&event, Instant::now());
+                    }
+                    // A permission request waits for the user only if someone can answer it;
+                    // otherwise its reply is dropped and the agent asks in its terminal.
+                    if let Some(reply) = reply
+                        && client.is_some()
+                    {
+                        pending.insert(id, (reply, Instant::now()));
+                    }
+                    send(&tap, &DaemonMsg::Hook { id, event });
                 }
-                send(&tap, &DaemonMsg::Hook { id, event });
+                Request::Tool { name, arguments } => {
+                    let outcome =
+                        coord::run(&mut sessions, data_dir.as_deref(), id, &name, &arguments);
+                    if let Some(reply) = reply {
+                        reply.send(&outcome.to_mcp());
+                    }
+                    if let Some((from, to)) = outcome.link {
+                        send(&tap, &DaemonMsg::Pulse { from, to });
+                    }
+                }
             }
         }
+        pending.retain(|_, (_, since)| since.elapsed() < agent::PERMISSION_WAIT);
         match ctl_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Control::Connected(stream)) => {
                 let Some(reader) = handshake(&stream, token) else {
@@ -120,6 +159,14 @@ pub fn serve(listener: TcpListener, token: &str, idle_exit: Duration) -> anyhow:
                 client = Some(generation);
                 had_client = true;
             }
+            Ok(Control::Msg(from, ClientMsg::Decide { id, allow })) if client == Some(from) => {
+                // No answer (`None`): the reply is dropped, the agent asks in its terminal.
+                if let Some((reply, _)) = pending.remove(&id)
+                    && let Some(allow) = allow
+                {
+                    reply.send(&agent::decision(allow));
+                }
+            }
             Ok(Control::Msg(from, msg)) if client == Some(from) => {
                 if !handle(msg, &mut sessions, &tap, &app_tx) {
                     sessions.iter_mut().for_each(Session::kill);
@@ -133,6 +180,7 @@ pub fn serve(listener: TcpListener, token: &str, idle_exit: Duration) -> anyhow:
             }
             Ok(Control::Gone(from)) if client == Some(from) => {
                 client = None;
+                pending.clear();
                 *tap.lock().unwrap() = None;
                 tracing::info!("client detached");
             }
@@ -224,7 +272,7 @@ fn handle(
             }
         }
         ClientMsg::Shutdown => return false,
-        ClientMsg::Hello { .. } => {}
+        ClientMsg::Hello { .. } | ClientMsg::Decide { .. } => {}
     }
     true
 }
@@ -311,7 +359,7 @@ mod tests {
     fn start(idle_exit: Duration) -> (u16, thread::JoinHandle<anyhow::Result<()>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || serve(listener, "secret", idle_exit));
+        let server = thread::spawn(move || serve(listener, "secret", idle_exit, None));
         (port, server)
     }
 
@@ -393,6 +441,76 @@ mod tests {
             "second was told"
         );
         third.link.send(&ClientMsg::Shutdown).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn agents_get_tools_and_the_user_answers_their_permissions() {
+        let (port, server) = start(IDLE_EXIT);
+        let attached = link::connect(port, "secret").unwrap();
+        let (hook_port, hook_token) = attached.hooks.clone().unwrap();
+        let (tx, rx) = mpsc::channel();
+        attached.link.listen(attached.reader, tx);
+        let shell = if cfg!(windows) { "cmd.exe" } else { "sh" };
+        attached
+            .link
+            .send(&ClientMsg::Spawn {
+                id: 1,
+                name: "coder".into(),
+                launch: Launch::new(vec![shell.into()], std::env::temp_dir()),
+                rows: 24,
+                cols: 80,
+            })
+            .unwrap();
+        let agent = AgentInfo::new(5, PathBuf::new(), None, Instant::now());
+        attached
+            .link
+            .send(&ClientMsg::Meta {
+                id: 1,
+                name: "coder".into(),
+                folder: Some(5),
+                ephemeral: false,
+                agent: Some(agent.snapshot(Instant::now())),
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+
+        // A tool call through the hook channel, as `chiika mcp` makes it.
+        let wait = Duration::from_secs(5);
+        let message = channel::tool_message("team", &serde_json::json!({}));
+        let answer = channel::request(hook_port, &hook_token, "1", &message, wait).unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+        assert_eq!(
+            answer["content"][0]["text"],
+            "- coder (you): agent, starting"
+        );
+
+        // A permission request waits for the user's answer.
+        let hook = br#"{"hook_event_name":"PermissionRequest","tool_name":"Bash"}"#.to_vec();
+        let asking = thread::spawn(move || {
+            channel::request(hook_port, &hook_token, "1", &hook, Duration::from_secs(10))
+        });
+        let seen = loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                AppEvent::Hook(id, event) => break (id, event.name),
+                _ => continue,
+            }
+        };
+        assert_eq!(seen, (1, "PermissionRequest".to_string()));
+        attached
+            .link
+            .send(&ClientMsg::Decide {
+                id: 1,
+                allow: Some(true),
+            })
+            .unwrap();
+        let decision = asking.join().unwrap().unwrap();
+        assert_eq!(decision, agent::decision(true));
+
+        attached.link.close();
+        thread::sleep(Duration::from_millis(300));
+        let second = link::connect(port, "secret").unwrap();
+        second.link.send(&ClientMsg::Shutdown).unwrap();
         server.join().unwrap().unwrap();
     }
 
