@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use crate::agent::{self, AgentInfo};
 use crate::app::AppEvent;
+use crate::audit;
 use crate::channel::{self, Reply, Request};
 use crate::config;
 use crate::coord;
@@ -123,13 +124,23 @@ pub fn serve(
                         .and_then(|s| s.agent.as_mut());
                     if let Some(agent) = agent {
                         agent.apply(&event, Instant::now());
+                        if let Some(dir) = &data_dir {
+                            audit::record(dir, id, agent, &event.name, Some(&event));
+                        }
                     }
                     // A permission request waits for the user only if someone can answer it;
                     // otherwise its reply is dropped and the agent asks in its terminal.
-                    if let Some(reply) = reply
-                        && client.is_some()
-                    {
-                        pending.insert(id, (reply, Instant::now()));
+                    if let Some(reply) = reply {
+                        if client.is_some() {
+                            pending.insert(id, (reply, Instant::now()));
+                        } else {
+                            audit_session(
+                                &sessions,
+                                data_dir.as_deref(),
+                                id,
+                                "permission_to_terminal",
+                            );
+                        }
                     }
                     send(&tap, &DaemonMsg::Hook { id, event });
                 }
@@ -145,7 +156,13 @@ pub fn serve(
                 }
             }
         }
-        pending.retain(|_, (_, since)| since.elapsed() < agent::PERMISSION_WAIT);
+        pending.retain(|&id, (_, since)| {
+            let waiting = since.elapsed() < agent::PERMISSION_WAIT;
+            if !waiting {
+                audit_session(&sessions, data_dir.as_deref(), id, "permission_expired");
+            }
+            waiting
+        });
         match ctl_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Control::Connected(stream)) => {
                 let Some(reader) = handshake(&stream, token) else {
@@ -280,6 +297,17 @@ fn handle(
     true
 }
 
+/// Records `event` of agent session `id` in the audit log, if it is an agent of a project.
+fn audit_session(sessions: &[Session], data_dir: Option<&Path>, id: u32, event: &str) {
+    let agent = sessions
+        .iter()
+        .find(|s| s.id == id)
+        .and_then(|s| s.agent.as_ref());
+    if let (Some(dir), Some(agent)) = (data_dir, agent) {
+        audit::record(dir, id, agent, event, None);
+    }
+}
+
 /// The first frame must be `Hello` with the right token; returns the read side.
 fn handshake(stream: &TcpStream, token: &str) -> Option<TcpStream> {
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
@@ -370,9 +398,17 @@ mod tests {
     use crate::protocol::{Launch, MarksSnapshot, SessionInfo};
 
     fn start(idle_exit: Duration) -> (u16, thread::JoinHandle<anyhow::Result<()>>) {
+        start_in(idle_exit, None)
+    }
+
+    /// A daemon whose project data is in `data_dir`.
+    fn start_in(
+        idle_exit: Duration,
+        data_dir: Option<PathBuf>,
+    ) -> (u16, thread::JoinHandle<anyhow::Result<()>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || serve(listener, "secret", idle_exit, None, "b1"));
+        let server = thread::spawn(move || serve(listener, "secret", idle_exit, data_dir, "b1"));
         (port, server)
     }
 
@@ -460,7 +496,9 @@ mod tests {
 
     #[test]
     fn agents_get_tools_and_the_user_answers_their_permissions() {
-        let (port, server) = start(IDLE_EXIT);
+        let data = std::env::temp_dir().join(format!("chiika-daemon-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        let (port, server) = start_in(IDLE_EXIT, Some(data.clone()));
         let attached = link::connect(port, "secret").unwrap();
         let (hook_port, hook_token) = attached.hooks.clone().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -476,7 +514,9 @@ mod tests {
                 cols: 80,
             })
             .unwrap();
-        let agent = AgentInfo::new(5, PathBuf::new(), None, Instant::now());
+        let mut agent = AgentInfo::new(5, PathBuf::new(), None, Instant::now());
+        agent.role = "coder".into();
+        agent.team_name = "backend".into();
         attached
             .link
             .send(&ClientMsg::Meta {
@@ -484,7 +524,7 @@ mod tests {
                 name: "coder".into(),
                 folder: Some(5),
                 ephemeral: false,
-                agent: Some(agent.snapshot(Instant::now())),
+                agent: Some(Box::new(agent.snapshot(Instant::now()))),
             })
             .unwrap();
         thread::sleep(Duration::from_millis(300));
@@ -520,6 +560,20 @@ mod tests {
             .unwrap();
         let decision = asking.join().unwrap().unwrap();
         assert_eq!(decision, agent::decision(true));
+
+        // The daemon wrote the hook in the audit log, with the agent's team and role.
+        let log = std::fs::read_dir(data.join("audit"))
+            .unwrap()
+            .next()
+            .unwrap();
+        let text = std::fs::read_to_string(log.unwrap().path()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(line["event"], "PermissionRequest");
+        assert_eq!(line["tool"], "Bash");
+        assert_eq!(
+            (&line["team"], &line["role"]),
+            (&"backend".into(), &"coder".into())
+        );
 
         attached.link.close();
         thread::sleep(Duration::from_millis(300));

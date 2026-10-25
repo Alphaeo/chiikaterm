@@ -147,10 +147,15 @@ pub fn load<T: Default + DeserializeOwned>(path: &Path) -> T {
 }
 
 pub fn save<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    save_text(path, &toml::to_string(value)?)
+}
+
+/// Writes `text` to `path`, creating its folder.
+pub fn save_text(path: &Path, text: &str) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, toml::to_string(value)?)?;
+    std::fs::write(path, text)?;
     Ok(())
 }
 

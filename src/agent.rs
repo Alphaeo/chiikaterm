@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 
 use crate::channel::HookEvent;
 use crate::config::AgentEntry;
+use crate::policy::Rules;
 use crate::protocol::AgentSnapshot;
 
 /// Roles offered when adding an agent, with the duty added to its system prompt.
@@ -88,6 +89,11 @@ pub struct AgentInfo {
     pub permission: Option<Instant>,
     /// Claude Code's conversation id, to resume it (`None` for agents of older chiika builds).
     pub conversation: Option<String>,
+    /// Its role and its team's name when it started, for the audit log.
+    pub role: String,
+    pub team_name: String,
+    /// Permission rules the project's policy gave it.
+    pub rules: usize,
 }
 
 impl AgentInfo {
@@ -103,6 +109,9 @@ impl AgentInfo {
             files: Vec::new(),
             permission: None,
             conversation: None,
+            role: String::new(),
+            team_name: String::new(),
+            rules: 0,
         }
     }
 
@@ -121,6 +130,9 @@ impl AgentInfo {
                 .permission
                 .map(|t| now.saturating_duration_since(t).as_millis() as u64),
             conversation: self.conversation.clone(),
+            role: self.role.clone(),
+            team_name: self.team_name.clone(),
+            rules: self.rules,
         }
     }
 
@@ -139,6 +151,9 @@ impl AgentInfo {
                 .permission_ms
                 .and_then(|ms| now.checked_sub(Duration::from_millis(ms))),
             conversation: snapshot.conversation.clone(),
+            role: snapshot.role.clone(),
+            team_name: snapshot.team_name.clone(),
+            rules: snapshot.rules,
         }
     }
 
@@ -246,18 +261,14 @@ fn edited_file(event: &HookEvent) -> Option<String> {
     }
 }
 
-/// Text added to the agent's system prompt.
+/// Text added to the agent's system prompt; `duty` is what its role does (`Policy::duty`).
 pub fn system_prompt(
-    role: &str,
+    duty: &str,
     team: &str,
     instructions: &str,
     folder: &Path,
     worktree: Option<&str>,
 ) -> String {
-    let duty = ROLES
-        .iter()
-        .find(|(name, _)| *name == role)
-        .map_or("", |(_, duty)| duty);
     let place = match worktree {
         Some(name) => format!(
             "You work in your own git worktree \"{name}\", created for this session: commit your \
@@ -307,8 +318,9 @@ pub fn mcp_config(exe: &Path, port: u16, token: &str, session: u32) -> String {
     .to_string()
 }
 
-/// Claude Code settings that run `<exe> hook` on every hook chiika listens to.
-pub fn hook_settings(exe: &Path) -> String {
+/// Claude Code settings that run `<exe> hook` on every hook chiika listens to, with the
+/// permission `rules` of the project's policy.
+pub fn hook_settings(exe: &Path, rules: &Rules) -> String {
     // Claude runs hook commands with a POSIX shell (Git Bash on Windows): forward slashes.
     let command = format!("\"{}\" hook", exe.display().to_string().replace('\\', "/"));
     let hooks: serde_json::Map<String, serde_json::Value> = HOOKS
@@ -326,10 +338,13 @@ pub fn hook_settings(exe: &Path) -> String {
             (name.to_string(), entry)
         })
         .collect();
+    // The chiika tools never ask for permission.
+    let allow: Vec<&str> = std::iter::once("mcp__chiika")
+        .chain(rules.allow.iter().map(String::as_str))
+        .collect();
     serde_json::json!({
         "hooks": hooks,
-        // The chiika tools never ask for permission.
-        "permissions": { "allow": ["mcp__chiika"] },
+        "permissions": { "allow": allow, "ask": rules.ask, "deny": rules.deny },
     })
     .to_string()
 }
@@ -425,8 +440,9 @@ pub fn free_worktree_name(root: &Path, base: &str, n: u32) -> String {
 
 /// `.chiika/.gitignore` keeping the agents' files out of the project's git status.
 pub fn ensure_gitignore(data_dir: &Path) -> std::io::Result<()> {
-    const IGNORED: [&str; 5] = [
+    const IGNORED: [&str; 6] = [
         "agents/",
+        "audit/",
         "bin/",
         "daemon.toml",
         "layout.toml",
@@ -636,7 +652,7 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert_eq!(
             text,
-            "agents/\nmine\nbin/\ndaemon.toml\nlayout.toml\nagents.toml\n"
+            "agents/\nmine\naudit/\nbin/\ndaemon.toml\nlayout.toml\nagents.toml\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -658,7 +674,7 @@ mod tests {
     #[test]
     fn prompt_has_role_team_instructions_and_place() {
         let prompt = system_prompt(
-            "reviewer",
+            ROLES[2].1,
             "backend",
             "# backend\nRust API.\n",
             Path::new("/w"),
@@ -668,7 +684,7 @@ mod tests {
         assert!(prompt.contains("You are the reviewer"));
         assert!(prompt.contains("Rust API."));
         assert!(prompt.contains("worktree \"backend-reviewer-3\""));
-        let here = system_prompt("coder", "t", "", Path::new("/p"), None);
+        let here = system_prompt("", "t", "", Path::new("/p"), None);
         assert!(here.contains("project folder"));
     }
 
@@ -686,13 +702,26 @@ mod tests {
 
     #[test]
     fn settings_run_chiika_hook_for_every_event() {
-        let settings = hook_settings(Path::new("C:\\bin\\chiika.exe"));
+        let rules = Rules {
+            allow: vec!["Bash(cargo test:*)".into()],
+            ask: vec![],
+            deny: vec!["Read(./.env)".into()],
+        };
+        let settings = hook_settings(Path::new("C:\\bin\\chiika.exe"), &rules);
         let value: serde_json::Value = serde_json::from_str(&settings).unwrap();
         for name in HOOKS {
             let command = &value["hooks"][name][0]["hooks"][0]["command"];
             assert_eq!(command, "\"C:/bin/chiika.exe\" hook");
         }
-        assert_eq!(value["permissions"]["allow"][0], "mcp__chiika");
+        assert_eq!(
+            value["permissions"]["allow"],
+            serde_json::json!(["mcp__chiika", "Bash(cargo test:*)"])
+        );
+        assert_eq!(
+            value["permissions"]["deny"],
+            serde_json::json!(["Read(./.env)"])
+        );
+        assert_eq!(value["permissions"]["ask"], serde_json::json!([]));
         let permission = &value["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"];
         assert!(permission.as_u64().unwrap() > PERMISSION_WAIT.as_secs());
     }

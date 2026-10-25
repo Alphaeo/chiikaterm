@@ -286,7 +286,10 @@ impl Session {
                 name: self.name.clone(),
                 folder: self.folder,
                 ephemeral: self.ephemeral,
-                agent: self.agent.as_ref().map(|agent| agent.snapshot(now)),
+                agent: self
+                    .agent
+                    .as_ref()
+                    .map(|agent| Box::new(agent.snapshot(now))),
             };
             if let Err(e) = link.send(&meta) {
                 tracing::warn!(id = self.id, "cannot update the daemon: {e}");

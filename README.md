@@ -147,6 +147,59 @@ A key chiika cannot read keeps its default, and the status bar says so.
    computer…), the next `chiika` offers to resume them: each one comes back in its team and its
    worktree, where it left off. An agent you close yourself is not offered again.
 
+## Governance
+
+### Teams in the repository
+
+`.chiika/canvas.toml` (the teams) and `.chiika/teams/*/TEAM.md` (their instructions) can be
+committed: everyone who clones the project gets the same teams. chiika's local files (daemon,
+agents' settings, panes, audit log) are kept out of git by `.chiika/.gitignore`.
+
+### Policy
+
+`.chiika/policy.toml` says what the project's agents may do (`≡ menu › open policy` creates a
+commented one). Rules use [Claude Code's permission syntax](https://docs.anthropic.com/en/docs/claude-code/settings#permission-settings):
+
+```toml
+[permissions]                    # every agent of the project
+deny  = ["Bash(git push:*)", "Read(./.env)", "Read(./.env.*)"]
+ask   = ["Bash(rm:*)"]
+allow = ["Bash(cargo test:*)"]
+
+[roles.tester.permissions]       # one role
+allow = ["Bash(cargo nextest:*)"]
+
+[roles.security]                 # a role of your own, offered by "+ agent"
+duty = "You audit the team's changes for security issues and report each one."
+
+[teams.backend.permissions]      # one team, by name
+deny = ["Edit(./frontend/**)"]
+```
+
+An agent gets the project's rules, plus its team's and its role's, in its Claude Code settings:
+**Claude enforces them itself** (deny wins over ask, ask over allow), whether chiika is open or
+not. A policy chiika cannot read stops agents from starting until it is fixed; a change applies to
+agents started or resumed after it. Each agent's panel on the canvas shows how many rules it got.
+
+To enforce rules on a whole machine, whatever the project says, use Claude Code's
+[managed settings](https://docs.anthropic.com/en/docs/claude-code/settings#settings-files): they
+take precedence over chiika's.
+
+### Audit log
+
+`.chiika/audit/YYYY-MM-DD.jsonl` (UTC days) gets one JSON line per event: agent started, resumed
+or closed, each tool it asked for and ran (with the command or file), each permission request and
+its answer (allowed or denied in chiika, sent to the terminal, expired), end of each turn. Every
+line has the time (UTC), the OS user, the team, the role and the conversation id:
+
+```json
+{"time":"2026-10-25T09:30:00Z","user":"alice","event":"PreToolUse","session":3,"team":"backend","role":"coder","conversation":"…","tool":"Bash","command":"cargo test"}
+```
+
+```sh
+jq -c 'select(.event | startswith("permission"))' .chiika/audit/*.jsonl   # who allowed what
+```
+
 ## Build from source
 
 ```powershell

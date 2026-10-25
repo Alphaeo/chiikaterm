@@ -18,6 +18,7 @@ use crate::fx::{format_duration, fuzzy_match};
 use crate::keys::{Keys, chord_matches, encode_key, encode_paste};
 use crate::layout::{Dir, Layout, Split};
 use crate::link::{self, Link};
+use crate::policy::Policy;
 use crate::protocol::{ClientMsg, Launch, MarksSnapshot, SessionInfo};
 use crate::session::{Session, Status};
 use crate::shell::Integration;
@@ -247,9 +248,11 @@ pub enum MenuAction {
     ShellMenu,
     SetShell(&'static str),
     ToggleIntegration,
+    /// Edits the project's agent policy.
+    OpenPolicy,
     /// Opens the role menu to add an agent to this team.
     AgentRoles(u32),
-    /// Team, index in `agent::ROLES`.
+    /// Team, index in the policy's roles (`Policy::roles`).
     AddAgent(u32, usize),
 }
 
@@ -853,7 +856,28 @@ impl App {
                 return;
             }
         }
-        match self.spawn_session(format!("edit {team}"), editor_launch(&path), Place::Replace) {
+        self.open_in_editor(format!("edit {team}"), &path);
+    }
+
+    /// `≡ menu › open policy`: the project's policy in the editor, from a commented template the
+    /// first time.
+    fn open_policy(&mut self) {
+        let Some(path) = self.paths.project.as_deref().map(crate::policy::file) else {
+            self.status_msg = Some("no project folder to keep a policy in".into());
+            return;
+        };
+        if !path.exists()
+            && let Err(e) = config::save_text(&path, crate::policy::TEMPLATE)
+        {
+            self.status_msg = Some(format!("cannot create {}: {e:#}", path.display()));
+            return;
+        }
+        self.open_in_editor("edit policy".into(), &path);
+    }
+
+    /// Edits `path` in a session that closes back to the canvas.
+    fn open_in_editor(&mut self, name: String, path: &Path) {
+        match self.spawn_session(name, editor_launch(path), Place::Replace) {
             Ok(session) => {
                 if let Some(s) = self.session_mut(session) {
                     s.ephemeral = true;
@@ -1005,9 +1029,23 @@ impl App {
             self.close_session(id);
             self.reload_consignes();
             self.set_view(View::Canvas);
+            // A broken policy blocks the agents: say so as soon as it is saved.
+            if let Err(e) = self.policy() {
+                self.status_msg = Some(format!("policy: {e}"));
+            }
         }
-        self.pending
-            .retain(|_, (_, since)| now.saturating_duration_since(*since) < agent::PERMISSION_WAIT);
+        let expired: Vec<u32> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, since))| {
+                now.saturating_duration_since(*since) >= agent::PERMISSION_WAIT
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in expired {
+            self.pending.remove(&id);
+            self.audit(id, "permission_expired", None);
+        }
         self.pulses
             .retain(|&(_, _, at)| now.saturating_duration_since(at) < canvas::PULSE);
         if now.saturating_duration_since(self.consigne_checked) > CONSIGNE_RELOAD {
@@ -1428,6 +1466,7 @@ impl App {
                 self.status_msg = Some("applies to the shells started from now on".into());
             }
             MenuAction::ToggleSidebar => self.toggle_sidebar(),
+            MenuAction::OpenPolicy => self.open_policy(),
             MenuAction::EditConsigne(id) => self.edit_consigne(id),
             MenuAction::OpenBoard(id) => self.open_board(id),
             MenuAction::NewTeamAt(x, y) => {
@@ -1453,8 +1492,8 @@ impl App {
 
     pub(crate) fn role_menu(&self, team: u32) -> Vec<(String, MenuAction)> {
         (0..)
-            .zip(agent::ROLES)
-            .map(|(i, (role, _))| (format!("+ {role}"), MenuAction::AddAgent(team, i)))
+            .zip(self.policy().unwrap_or_default().roles())
+            .map(|(i, role)| (format!("+ {role}"), MenuAction::AddAgent(team, i)))
             .collect()
     }
 
@@ -1466,7 +1505,8 @@ impl App {
             self.picked = 0;
             return;
         }
-        let Some(&(role, _)) = agent::ROLES.get(role) else {
+        let roles = self.policy().unwrap_or_default().roles();
+        let Some(role) = roles.get(role).map(String::as_str) else {
             return;
         };
         let Some(root) = self.project_root() else {
@@ -1508,6 +1548,14 @@ impl App {
         }
     }
 
+    /// The project's policy (empty without a project or a policy file).
+    fn policy(&self) -> Result<Policy, String> {
+        self.paths
+            .project
+            .as_deref()
+            .map_or(Ok(Policy::default()), Policy::load)
+    }
+
     /// The project folder (the parent of `.chiika`).
     fn project_root(&self) -> Option<PathBuf> {
         let data = self.paths.project.as_ref()?;
@@ -1529,6 +1577,8 @@ impl App {
             return Err("agents need a project folder and the chiika channel".into());
         };
         let claude = agent::claude_exe().ok_or("claude code not found in PATH")?;
+        // Fail closed: no agent without the rules its team wrote.
+        let policy = self.policy()?;
         let team_name = self
             .folder(entry.team)
             .map_or_else(|| "team".to_string(), |f| f.name.clone());
@@ -1542,7 +1592,7 @@ impl App {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .unwrap_or_default();
         let prompt = agent::system_prompt(
-            &entry.role,
+            &policy.duty(&entry.role),
             &team_name,
             &instructions,
             &root,
@@ -1553,10 +1603,11 @@ impl App {
             .join(format!("agent-{id}"))
             .join("settings.json");
         let mcp = settings.with_file_name("mcp.json");
+        let rules = policy.rules(&team_name, &entry.role);
         settings
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&settings, agent::hook_settings(&exe)))
+            .and_then(|()| std::fs::write(&settings, agent::hook_settings(&exe, &rules)))
             .and_then(|()| std::fs::write(&mcp, agent::mcp_config(&exe, port, &token, id)))
             .map_err(|e| format!("cannot write {}: {e}", settings.display()))?;
         let mut argv = vec![
@@ -1588,10 +1639,28 @@ impl App {
             let mut info =
                 AgentInfo::new(entry.team, workdir, entry.worktree.clone(), Instant::now());
             info.conversation = Some(entry.conversation.clone());
+            info.role = entry.role.clone();
+            info.team_name = team_name;
+            info.rules = rules.len();
             s.agent = Some(info);
         }
         self.sync_session(session);
+        let event = if resume {
+            "agent_resumed"
+        } else {
+            "agent_started"
+        };
+        self.audit(session, event, None);
         Ok(session)
+    }
+
+    /// Records `event` of agent session `id` in the project's audit log; other sessions have
+    /// nothing to record.
+    fn audit(&self, id: u32, event: &str, hook: Option<&HookEvent>) {
+        let agent = self.session(id).and_then(|s| s.agent.as_ref());
+        if let (Some(dir), Some(agent)) = (&self.paths.project, agent) {
+            crate::audit::record(dir, id, agent, event, hook);
+        }
     }
 
     /// Changes `.chiika/agents.toml`, the agents to resume once the daemon is gone.
@@ -1723,6 +1792,12 @@ impl App {
         if let Some(agent) = self.session_mut(id).and_then(|s| s.agent.as_mut()) {
             agent.permission = None;
         }
+        let event = match allow {
+            Some(true) => "permission_allowed",
+            Some(false) => "permission_denied",
+            None => "permission_to_terminal",
+        };
+        self.audit(id, event, None);
         match &self.link {
             Some(link) => {
                 if let Err(e) = link.send(&ClientMsg::Decide { id, allow }) {
@@ -1744,6 +1819,7 @@ impl App {
         match request {
             Request::Hook(event) => {
                 self.on_hook(id, &event);
+                self.audit(id, &event.name, Some(&event));
                 if let Some(reply) = reply {
                     self.pending.insert(id, (reply, Instant::now()));
                 }
@@ -1893,6 +1969,7 @@ impl App {
             "shell integration: off"
         };
         items.push((integration.into(), MenuAction::ToggleIntegration));
+        items.push(("open policy".into(), MenuAction::OpenPolicy));
         items
     }
 
@@ -2014,6 +2091,7 @@ impl App {
         let Some(index) = self.sessions.iter().position(|s| s.id == id) else {
             return;
         };
+        self.audit(id, "agent_closed", None);
         let mut session = self.sessions.remove(index);
         session.kill();
         // Closed on purpose: not offered for resumption.

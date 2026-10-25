@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod audit;
 mod canvas;
 mod channel;
 mod config;
@@ -11,6 +12,7 @@ mod layout;
 mod link;
 mod mascot;
 mod mcp;
+mod policy;
 mod protocol;
 mod session;
 mod shell;

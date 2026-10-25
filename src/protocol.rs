@@ -137,7 +137,7 @@ pub enum ClientMsg {
         name: String,
         folder: Option<u32>,
         ephemeral: bool,
-        agent: Option<AgentSnapshot>,
+        agent: Option<Box<AgentSnapshot>>,
     },
     /// Answer the permission request held for agent `id`: allow, deny, or `None` to let the
     /// agent ask in its terminal.
@@ -234,6 +234,12 @@ pub struct AgentSnapshot {
     pub permission_ms: Option<u64>,
     #[serde(default)]
     pub conversation: Option<String>,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub team_name: String,
+    #[serde(default)]
+    pub rules: usize,
 }
 
 #[cfg(test)]
