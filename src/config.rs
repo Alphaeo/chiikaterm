@@ -1,9 +1,12 @@
-//! Files chiika keeps: the user config (agents) and the per-project canvas (teams).
+//! Files chiika keeps: the user config, and per project the canvas (teams), the panes and the
+//! agents.
 
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::layout::Layout;
 
 /// What the user answered when chiika offered to connect an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +109,32 @@ pub struct CanvasFile {
     pub teams: Vec<TeamEntry>,
 }
 
+/// `.chiika/layout.toml`: the panes as the TUI left them, for the next attach.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutFile {
+    pub focused: Option<u32>,
+    pub layout: Option<Layout>,
+}
+
+/// `.chiika/agents.toml`: the project's agents, to resume them once the daemon is gone.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsFile {
+    #[serde(default, rename = "agent")]
+    pub agents: Vec<AgentEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEntry {
+    pub team: u32,
+    /// One of `agent::ROLES`.
+    pub role: String,
+    /// Where it works: its worktree, or the project folder.
+    pub folder: PathBuf,
+    pub worktree: Option<String>,
+    /// Claude Code's conversation id (`--session-id`, `--resume`).
+    pub conversation: String,
+}
+
 /// Reads a TOML file; a missing file gives the default, an invalid one too (logged).
 pub fn load<T: Default + DeserializeOwned>(path: &Path) -> T {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -199,6 +228,36 @@ mod tests {
         };
         save(&path, &canvas).unwrap();
         assert_eq!(load::<CanvasFile>(&path), canvas);
+    }
+
+    #[test]
+    fn layout_and_agents_round_trip() {
+        let path = temp_file("layout.toml");
+        let mut layout = Layout::Pane(1);
+        layout.split(1, 4, crate::layout::Split::Down);
+        let file = LayoutFile {
+            focused: Some(4),
+            layout: Some(layout),
+        };
+        save(&path, &file).unwrap();
+        assert_eq!(load::<LayoutFile>(&path), file);
+
+        let path = temp_file("agents.toml");
+        let file = AgentsFile {
+            agents: vec![AgentEntry {
+                team: 2,
+                role: "coder".into(),
+                folder: PathBuf::from("/p/.claude/worktrees/api-coder-3"),
+                worktree: Some("api-coder-3".into()),
+                conversation: "0f8e5a0c-3b8e-4d7a-9c1e-2a4b6c8d0e1f".into(),
+            }],
+        };
+        save(&path, &file).unwrap();
+        assert_eq!(load::<AgentsFile>(&path), file);
+        assert_eq!(
+            load::<AgentsFile>(&temp_file("none.toml")),
+            AgentsFile::default()
+        );
     }
 
     #[test]

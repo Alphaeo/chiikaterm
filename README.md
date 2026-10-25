@@ -30,7 +30,7 @@ them while you watch.
   (`team`, `send_to`, `read_screen`, `post`, `board`). Answer their permission requests from the
   canvas.
 - **Daemon**: shells and agents keep running when you close chiika or its window; run `chiika`
-  again in the same folder to get them back.
+  again in the same folder to get them back, with your panes and their scrollback.
 
 ## Install
 
@@ -143,6 +143,9 @@ A key chiika cannot read keeps its default, and the status bar says so.
    others with `send_to` and keep notes on the team board.
 4. When an agent needs a permission, its mascot raises a `!`: answer from its panel on the
    canvas, or in its terminal.
+5. Agents remember their conversation. If they were stopped (`q › close all`, a restart of the
+   computer…), the next `chiika` offers to resume them: each one comes back in its team and its
+   worktree, where it left off. An agent you close yourself is not offered again.
 
 ## Build from source
 

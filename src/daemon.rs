@@ -295,7 +295,7 @@ fn handshake(stream: &TcpStream, token: &str) -> Option<TcpStream> {
     Some(reader)
 }
 
-/// Sends the welcome and every screen, then makes `stream` the client. All screens stay locked
+/// Sends the welcome and every screen with its history, then makes `stream` the client. All screens stay locked
 /// meanwhile: output that follows a screen is sent after it, none is lost or doubled.
 fn attach(
     tap: &Tap,
@@ -307,7 +307,7 @@ fn attach(
     let now = Instant::now();
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let screens: Vec<_> = sessions.iter().map(|s| s.parser.lock().unwrap()).collect();
+    let mut screens: Vec<_> = sessions.iter().map(|s| s.parser.lock().unwrap()).collect();
     let welcome = DaemonMsg::Welcome {
         sessions: sessions
             .iter()
@@ -319,9 +319,12 @@ fn attach(
     };
     let mut tap = tap.lock().unwrap();
     let sent = protocol::write_msg(&mut stream, &welcome).and_then(|()| {
-        sessions.iter().zip(&screens).try_for_each(|(s, screen)| {
-            protocol::write_data(&mut stream, s.id, &screen.screen().state_formatted())
-        })
+        sessions
+            .iter()
+            .zip(&mut screens)
+            .try_for_each(|(s, screen)| {
+                protocol::write_data(&mut stream, s.id, &Session::screen_with_history(screen))
+            })
     });
     *tap = match sent {
         Ok(()) => Some(Box::new(stream) as Box<dyn Write + Send>),

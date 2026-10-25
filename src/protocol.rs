@@ -232,6 +232,8 @@ pub struct AgentSnapshot {
     pub files: Vec<String>,
     /// How long chiika has held its permission request, if it does.
     pub permission_ms: Option<u64>,
+    #[serde(default)]
+    pub conversation: Option<String>,
 }
 
 #[cfg(test)]

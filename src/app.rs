@@ -12,7 +12,7 @@ use ratatui::layout::{Position, Rect};
 use crate::agent::{self, AgentInfo, AgentState};
 use crate::canvas::{self, CanvasState};
 use crate::channel::{self, HookEvent, Reply, Request};
-use crate::config::{self, AgentChoice, CanvasFile, Config, SidebarPref, TeamEntry};
+use crate::config::{self, AgentChoice, AgentEntry, CanvasFile, Config, SidebarPref, TeamEntry};
 use crate::coord;
 use crate::fx::{format_duration, fuzzy_match};
 use crate::keys::{Keys, chord_matches, encode_key, encode_paste};
@@ -106,6 +106,14 @@ pub struct Paths {
 impl Paths {
     fn canvas_file(&self) -> Option<PathBuf> {
         Some(self.project.as_ref()?.join("canvas.toml"))
+    }
+
+    fn layout_file(&self) -> Option<PathBuf> {
+        Some(self.project.as_ref()?.join("layout.toml"))
+    }
+
+    fn agents_file(&self) -> Option<PathBuf> {
+        Some(self.project.as_ref()?.join("agents.toml"))
     }
 
     fn team_file(&self, id: u32) -> Option<PathBuf> {
@@ -225,6 +233,9 @@ pub enum MenuAction {
     /// Replace a daemon of another build (closing its sessions).
     RestartDaemon,
     KeepDaemon,
+    /// Start again the agents of a daemon that is gone, or forget them.
+    ResumeAgents,
+    ForgetAgents,
     SetTheme(usize),
     ToggleSidebar,
     EditConsigne(u32),
@@ -485,6 +496,8 @@ impl App {
         }
         if app.stale_daemon {
             app.ask_restart();
+        } else if app.mode != Mode::Onboarding {
+            app.ask_resume();
         }
         app
     }
@@ -584,17 +597,54 @@ impl App {
             }
             self.stale_daemon = true;
         }
-        // One pane, on a shell rather than an agent (agents live in their team boxes).
+        // The panes as they were left; else one pane, on a shell rather than an agent (agents
+        // live in their team boxes).
+        let saved = self.restore_layout();
         let first = self
             .sessions
             .iter()
             .find(|s| s.agent.is_none() && !s.ephemeral)
             .or(self.sessions.first())
             .map(|s| s.id);
-        if let Some(first) = first {
-            self.layout = Some(Layout::Pane(first));
-            self.focus(first);
+        let (layout, focused) = match saved {
+            Some((layout, focused)) => (Some(layout), Some(focused)),
+            None => (first.map(Layout::Pane), first),
+        };
+        if let Some(focused) = focused {
+            self.layout = layout;
+            self.focus(focused);
             self.relayout();
+        }
+    }
+
+    /// The saved panes whose sessions the daemon still has, with the pane to focus. Session ids
+    /// only mean something to the daemon that gave them: a new daemon forgets the file.
+    fn restore_layout(&self) -> Option<(Layout, u32)> {
+        let path = self.paths.layout_file()?;
+        if self.sessions.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        let file: config::LayoutFile = config::load(&path);
+        let layout = file.layout?.pruned(&|id| self.session(id).is_some())?;
+        let panes = layout.panes();
+        let focused = file
+            .focused
+            .filter(|id| panes.contains(id))
+            .unwrap_or(panes[0]);
+        Some((layout, focused))
+    }
+
+    fn save_layout(&self) {
+        let Some(path) = self.paths.layout_file() else {
+            return;
+        };
+        let file = config::LayoutFile {
+            focused: self.focused,
+            layout: self.layout.clone(),
+        };
+        if let Err(e) = config::save(&path, &file) {
+            tracing::warn!("cannot save the panes: {e:#}");
         }
     }
 
@@ -607,7 +657,10 @@ impl App {
                     tracing::warn!("cannot stop the daemon: {e}");
                 }
             }
-            Some(link) => link.close(),
+            Some(link) => {
+                self.save_layout();
+                link.close();
+            }
             None => self.kill_all(),
         }
     }
@@ -1357,6 +1410,8 @@ impl App {
             MenuAction::Detach => self.status_msg = Some(NO_DAEMON.into()),
             MenuAction::RestartDaemon => self.restart_daemon(),
             MenuAction::KeepDaemon => {}
+            MenuAction::ResumeAgents => self.resume_agents(),
+            MenuAction::ForgetAgents => self.forget_agents(),
             MenuAction::QuitAll => {
                 self.detach = false;
                 self.should_quit = true;
@@ -1414,34 +1469,19 @@ impl App {
         let Some(&(role, _)) = agent::ROLES.get(role) else {
             return;
         };
-        let (Some(data), Some(exe), Some((port, token))) = (
-            self.paths.project.clone(),
-            self.tool_exe.clone().or_else(|| self.paths.exe.clone()),
-            self.hooks.clone(),
-        ) else {
+        let Some(root) = self.project_root() else {
             self.status_msg = Some("agents need a project folder and the chiika channel".into());
             return;
         };
-        let Some(claude) = agent::claude_exe() else {
-            self.status_msg = Some("claude code not found in PATH".into());
-            return;
-        };
-        let root = data
-            .parent()
-            .map_or_else(|| data.clone(), Path::to_path_buf);
         let team_name = self
             .folder(team)
             .map_or_else(|| "team".to_string(), |f| f.name.clone());
-        let id = self.next_id;
-        if let Err(e) = agent::ensure_gitignore(&data) {
-            tracing::warn!("cannot write .chiika/.gitignore: {e}");
-        }
         // Claude creates the worktree itself (`--worktree`, from the project folder): it then
         // trusts it like the project, with no question at start.
         // ponytail: git runs on the UI thread (a few ms, once per agent).
         let worktree = if agent::has_commit(&root) {
             let base = format!("{}-{role}", agent::slug(&team_name));
-            Some(agent::free_worktree_name(&root, &base, id))
+            Some(agent::free_worktree_name(&root, &base, self.next_id))
         } else {
             self.toasts.push(Toast {
                 text: format!("{role} works in the project folder (no git commit to branch from)"),
@@ -1450,33 +1490,75 @@ impl App {
             });
             None
         };
-        let workdir = root.clone();
+        let entry = AgentEntry {
+            team,
+            role: role.to_string(),
+            folder: worktree
+                .as_deref()
+                .map_or_else(|| root.clone(), |name| agent::worktree_folder(&root, name)),
+            worktree,
+            conversation: agent::new_conversation_id(),
+        };
+        match self.launch_agent(&entry, false) {
+            Ok(session) => {
+                self.update_agents(|agents| agents.push(entry));
+                self.select_row(Row::Session(session));
+            }
+            Err(e) => self.status_msg = Some(format!("cannot start {role}: {e}")),
+        }
+    }
+
+    /// The project folder (the parent of `.chiika`).
+    fn project_root(&self) -> Option<PathBuf> {
+        let data = self.paths.project.as_ref()?;
+        Some(
+            data.parent()
+                .map_or_else(|| data.clone(), Path::to_path_buf),
+        )
+    }
+
+    /// Starts the agent `entry` in a hidden session of its team: a new conversation, or the
+    /// resumption of its saved one (`resume`). Returns the session.
+    fn launch_agent(&mut self, entry: &AgentEntry, resume: bool) -> Result<u32, String> {
+        let (Some(data), Some(root), Some(exe), Some((port, token))) = (
+            self.paths.project.clone(),
+            self.project_root(),
+            self.tool_exe.clone().or_else(|| self.paths.exe.clone()),
+            self.hooks.clone(),
+        ) else {
+            return Err("agents need a project folder and the chiika channel".into());
+        };
+        let claude = agent::claude_exe().ok_or("claude code not found in PATH")?;
+        let team_name = self
+            .folder(entry.team)
+            .map_or_else(|| "team".to_string(), |f| f.name.clone());
+        let id = self.next_id;
+        if let Err(e) = agent::ensure_gitignore(&data) {
+            tracing::warn!("cannot write .chiika/.gitignore: {e}");
+        }
         let instructions = self
             .paths
-            .team_file(team)
+            .team_file(entry.team)
             .and_then(|path| std::fs::read_to_string(path).ok())
             .unwrap_or_default();
         let prompt = agent::system_prompt(
-            role,
+            &entry.role,
             &team_name,
             &instructions,
-            &workdir,
-            worktree.as_deref(),
+            &root,
+            entry.worktree.as_deref(),
         );
         let settings = data
             .join("agents")
             .join(format!("agent-{id}"))
             .join("settings.json");
         let mcp = settings.with_file_name("mcp.json");
-        let written = settings
+        settings
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| std::fs::write(&settings, agent::hook_settings(&exe)))
-            .and_then(|()| std::fs::write(&mcp, agent::mcp_config(&exe, port, &token, id)));
-        if let Err(e) = written {
-            self.status_msg = Some(format!("cannot write {}: {e}", settings.display()));
-            return;
-        }
+            .and_then(|()| std::fs::write(&mcp, agent::mcp_config(&exe, port, &token, id)))
+            .map_err(|e| format!("cannot write {}: {e}", settings.display()))?;
         let mut argv = vec![
             claude.display().to_string(),
             "--settings".into(),
@@ -1486,9 +1568,10 @@ impl App {
             "--append-system-prompt".into(),
             prompt,
         ];
-        if let Some(name) = &worktree {
-            argv.extend(["--worktree".into(), name.clone()]);
-        }
+        argv.extend(agent::conversation_args(entry, resume));
+        // A new agent starts in the project folder (Claude moves to its worktree), a resumed one
+        // where its conversation was.
+        let workdir = if resume { entry.folder.clone() } else { root };
         let mut launch = Launch::new(argv, workdir.clone());
         launch.env.extend([
             ("CHIIKA_PORT".into(), port.to_string()),
@@ -1497,17 +1580,98 @@ impl App {
         ]);
         // Set when chiika itself runs inside Claude Code: it would turn off the agent's transcripts.
         launch.env_remove.push("CLAUDE_CODE_CHILD_SESSION".into());
-        match self.spawn_session(role.to_string(), launch, Place::Hidden) {
-            Ok(session) => {
-                if let Some(s) = self.session_mut(session) {
-                    s.folder = Some(team);
-                    s.agent = Some(AgentInfo::new(team, workdir, worktree, Instant::now()));
-                }
-                self.sync_session(session);
-                self.select_row(Row::Session(session));
-            }
-            Err(e) => self.status_msg = Some(format!("cannot start {role}: {e:#}")),
+        let session = self
+            .spawn_session(entry.role.clone(), launch, Place::Hidden)
+            .map_err(|e| format!("{e:#}"))?;
+        if let Some(s) = self.session_mut(session) {
+            s.folder = Some(entry.team);
+            let mut info =
+                AgentInfo::new(entry.team, workdir, entry.worktree.clone(), Instant::now());
+            info.conversation = Some(entry.conversation.clone());
+            s.agent = Some(info);
         }
+        self.sync_session(session);
+        Ok(session)
+    }
+
+    /// Changes `.chiika/agents.toml`, the agents to resume once the daemon is gone.
+    fn update_agents(&self, change: impl FnOnce(&mut Vec<AgentEntry>)) {
+        let Some(path) = self.paths.agents_file() else {
+            return;
+        };
+        let mut file: config::AgentsFile = config::load(&path);
+        change(&mut file.agents);
+        if let Err(e) = config::save(&path, &file) {
+            tracing::warn!("cannot save the agents: {e:#}");
+        }
+    }
+
+    /// Saved agents that no session runs: those of a daemon that is gone.
+    fn agents_to_resume(&self) -> Vec<AgentEntry> {
+        let Some(path) = self.paths.agents_file() else {
+            return Vec::new();
+        };
+        let file: config::AgentsFile = config::load(&path);
+        file.agents
+            .into_iter()
+            .filter(|entry| {
+                !self.sessions.iter().any(|s| {
+                    s.agent.as_ref().and_then(|a| a.conversation.as_deref())
+                        == Some(entry.conversation.as_str())
+                })
+            })
+            .collect()
+    }
+
+    /// The daemon is gone with its agents: offer to bring them back.
+    fn ask_resume(&mut self) {
+        let count = self.agents_to_resume().len();
+        if count == 0 {
+            return;
+        }
+        let items = vec![
+            (format!("resume {count} agent(s)"), MenuAction::ResumeAgents),
+            ("forget them".into(), MenuAction::ForgetAgents),
+        ];
+        let at = Position::new(
+            (self.area.width / 2).saturating_sub(12),
+            (self.area.height / 2).saturating_sub(2),
+        );
+        self.open_menu(items, at);
+        self.status_msg = Some("agents of the last session were stopped".into());
+    }
+
+    /// Starts again every saved agent no session runs, in its conversation. One whose team or
+    /// worktree is gone is forgotten.
+    fn resume_agents(&mut self) {
+        for entry in self.agents_to_resume() {
+            let problem = if self.folder(entry.team).is_none() {
+                Some("its team is gone".to_string())
+            } else if !entry.folder.is_dir() {
+                Some(format!("{} is gone", entry.folder.display()))
+            } else {
+                self.launch_agent(&entry, true).err()
+            };
+            if let Some(problem) = problem {
+                self.toasts.push(Toast {
+                    text: format!("{} not resumed: {problem}", entry.role),
+                    ok: false,
+                    born: Instant::now(),
+                });
+                self.update_agents(|agents| {
+                    agents.retain(|a| a.conversation != entry.conversation)
+                });
+            }
+        }
+    }
+
+    fn forget_agents(&mut self) {
+        let gone: Vec<String> = self
+            .agents_to_resume()
+            .into_iter()
+            .map(|entry| entry.conversation)
+            .collect();
+        self.update_agents(|agents| agents.retain(|a| !gone.contains(&a.conversation)));
     }
 
     /// A hook of an agent: new state, and a notification when it needs the user or is done.
@@ -1850,7 +2014,12 @@ impl App {
         let Some(index) = self.sessions.iter().position(|s| s.id == id) else {
             return;
         };
-        self.sessions.remove(index).kill();
+        let mut session = self.sessions.remove(index);
+        session.kill();
+        // Closed on purpose: not offered for resumption.
+        if let Some(conversation) = session.agent.and_then(|a| a.conversation) {
+            self.update_agents(|agents| agents.retain(|a| a.conversation != conversation));
+        }
         let only_pane = self.layout.as_ref().is_some_and(|l| l.panes() == [id]);
         if only_pane {
             self.layout = self.sessions.first().map(|s| Layout::Pane(s.id));
@@ -2509,6 +2678,55 @@ mod tests {
             pos: (0, 0),
             consigne: None,
         }
+    }
+
+    #[test]
+    fn saved_panes_come_back_without_gone_sessions() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Rect::new(0, 0, 120, 40), tx, Paths::default());
+        let dir = std::env::temp_dir().join(format!("chiika-layout-{}", std::process::id()));
+        app.paths.project = Some(dir.clone());
+        let mut layout = Layout::Pane(1);
+        layout.split(1, 7, Split::Right);
+        app.layout = Some(layout);
+        app.focused = Some(7);
+        app.save_layout();
+        // Session 7 is gone: its pane and the focus go with it.
+        assert_eq!(app.restore_layout(), Some((Layout::Pane(1), 1)));
+
+        app.kill_all();
+        app.sessions.clear();
+        assert_eq!(app.restore_layout(), None, "a new daemon");
+        assert!(!dir.join("layout.toml").exists());
+    }
+
+    #[test]
+    fn stopped_agents_are_offered_and_closed_ones_forgotten() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Rect::new(0, 0, 120, 40), tx, Paths::default());
+        let dir = std::env::temp_dir().join(format!("chiika-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        app.paths.project = Some(dir.clone());
+        let entry = |conversation: &str| AgentEntry {
+            team: 1,
+            role: "coder".into(),
+            folder: dir.clone(),
+            worktree: None,
+            conversation: conversation.into(),
+        };
+        app.update_agents(|agents| agents.extend([entry("running"), entry("stopped")]));
+        // The first shell plays the agent still running in the daemon.
+        let id = app.sessions[0].id;
+        let mut info = AgentInfo::new(1, dir.clone(), None, Instant::now());
+        info.conversation = Some("running".into());
+        app.sessions[0].agent = Some(info);
+
+        assert_eq!(app.agents_to_resume(), [entry("stopped")]);
+        app.close_session(id);
+        let saved: config::AgentsFile = config::load(&dir.join("agents.toml"));
+        assert_eq!(saved.agents, [entry("stopped")], "closed on purpose");
+        app.forget_agents();
+        assert!(app.agents_to_resume().is_empty());
     }
 
     #[test]

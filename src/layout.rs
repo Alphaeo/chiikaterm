@@ -1,9 +1,10 @@
 //! Split layout of the main area: a binary tree of panes, each showing one session.
 
 use ratatui::layout::{Position, Rect};
+use serde::{Deserialize, Serialize};
 
 /// How a pane is cut in two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Split {
     /// Side by side.
     Right,
@@ -20,7 +21,7 @@ pub enum Dir {
     Down,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Layout {
     /// A pane showing the session with this id.
     Pane(u32),
@@ -213,6 +214,27 @@ impl Layout {
         true
     }
 
+    /// The layout without the panes whose session `keep` refuses; `None` if none is left.
+    pub fn pruned(self, keep: &impl Fn(u32) -> bool) -> Option<Layout> {
+        match self {
+            Layout::Pane(id) => keep(id).then_some(self),
+            Layout::Split {
+                dir,
+                share,
+                first,
+                second,
+            } => match (first.pruned(keep), second.pruned(keep)) {
+                (Some(first), Some(second)) => Some(Layout::Split {
+                    dir,
+                    share,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (one, other) => one.or(other),
+            },
+        }
+    }
+
     /// Closest pane in direction `dir` from the pane of `from`, among those facing it.
     pub fn neighbor(&self, area: Rect, from: u32, dir: Dir) -> Option<u32> {
         let rects = self.rects(area);
@@ -280,6 +302,16 @@ mod tests {
         assert!(layout.split(1, 2, Split::Right));
         assert!(layout.split(2, 3, Split::Down));
         layout
+    }
+
+    #[test]
+    fn panes_of_gone_sessions_are_pruned() {
+        let layout = three_panes();
+        let pruned = layout.clone().pruned(&|id| id != 2).unwrap();
+        assert_eq!(pruned.panes(), [1, 3]);
+        assert_eq!(layout.clone().pruned(&|id| id == 1), Some(Layout::Pane(1)));
+        assert_eq!(layout.clone().pruned(&|_| false), None);
+        assert_eq!(layout.clone().pruned(&|_| true), Some(layout));
     }
 
     #[test]

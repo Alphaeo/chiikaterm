@@ -225,6 +225,28 @@ impl Session {
         }
     }
 
+    /// What the daemon sends of `parser` to an attaching client: its history, then its screen.
+    /// Replayed in a parser of the same size, the history lands in that parser's own.
+    pub fn screen_with_history(parser: &mut vt100::Parser<ShellMarks>) -> Vec<u8> {
+        let screen = parser.screen_mut();
+        let (rows, cols) = screen.size();
+        let mut out = Vec::new();
+        // ponytail: one offset per history line (1000 at most), each reading its top row.
+        screen.set_scrollback(usize::MAX);
+        for offset in (1..=screen.scrollback()).rev() {
+            screen.set_scrollback(offset);
+            out.extend(screen.rows_formatted(0, cols).next().unwrap_or_default());
+            out.extend(b"\x1b[m\r\n");
+        }
+        screen.set_scrollback(0);
+        // Pushes the last history lines off the screen, which the screen's state then repaints.
+        if !out.is_empty() {
+            out.extend(b"\r\n".repeat(usize::from(rows.saturating_sub(1))));
+        }
+        out.extend(screen.state_formatted());
+        out
+    }
+
     /// What the daemon tells an attaching client about this session; `screen` is its locked
     /// parser.
     pub fn info(&self, screen: &vt100::Parser<ShellMarks>, now: Instant) -> SessionInfo {
@@ -465,6 +487,40 @@ mod tests {
         session.resize(10, 40).unwrap();
         assert_eq!(session.parser.lock().unwrap().screen().size(), (10, 40));
         session.kill();
+    }
+
+    #[test]
+    fn history_and_screen_are_replayed() {
+        let mut daemon = vt100::Parser::new_with_callbacks(5, 20, 1000, ShellMarks::default());
+        for line in 1..=30 {
+            daemon.process(format!("\x1b[1mline {line}\x1b[m\r\n").as_bytes());
+        }
+        daemon.process(b"$ ls");
+        let bytes = Session::screen_with_history(&mut daemon);
+        let mut client = vt100::Parser::new_with_callbacks(5, 20, 1000, ShellMarks::default());
+        client.process(&bytes);
+
+        assert_eq!(client.screen().contents(), daemon.screen().contents());
+        assert_eq!(client.screen().cursor_position(), (4, 4));
+        let history = |p: &mut vt100::Parser<ShellMarks>| {
+            p.screen_mut().set_scrollback(usize::MAX);
+            let lines = p.screen().scrollback();
+            let top = p.screen().contents_formatted();
+            p.screen_mut().set_scrollback(0);
+            (lines, top)
+        };
+        let (lines, top) = history(&mut client);
+        assert_eq!((lines, top.clone()), history(&mut daemon));
+        assert!(
+            String::from_utf8_lossy(&top).contains("line 1"),
+            "bold kept"
+        );
+
+        let mut empty = vt100::Parser::new_with_callbacks(5, 20, 1000, ShellMarks::default());
+        empty.process(b"$ ");
+        let mut client = vt100::Parser::new_with_callbacks(5, 20, 1000, ShellMarks::default());
+        client.process(&Session::screen_with_history(&mut empty));
+        assert_eq!(history(&mut client).0, 0, "no history, no blank lines");
     }
 
     #[test]
