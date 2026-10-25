@@ -19,11 +19,73 @@ pub struct Agents {
     pub claude: Option<AgentChoice>,
 }
 
-/// `config.toml` in the user's config directory.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Sidebar as chiika opens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarPref {
+    #[default]
+    Open,
+    Collapsed,
+}
+
+/// Keys chiika takes even inside a shell (see `keys::Keys`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeysConfig {
+    pub leave: String,
+    pub pane_left: String,
+    pub pane_right: String,
+    pub pane_up: String,
+    pub pane_down: String,
+    pub scroll_up: String,
+    pub scroll_down: String,
+    pub prev_command: String,
+    pub next_command: String,
+}
+
+impl Default for KeysConfig {
+    fn default() -> KeysConfig {
+        KeysConfig {
+            leave: "ctrl+q".into(),
+            pane_left: "alt+left".into(),
+            pane_right: "alt+right".into(),
+            pane_up: "alt+up".into(),
+            pane_down: "alt+down".into(),
+            scroll_up: "shift+pageup".into(),
+            scroll_down: "shift+pagedown".into(),
+            prev_command: "alt+pageup".into(),
+            next_command: "alt+pagedown".into(),
+        }
+    }
+}
+
+/// `config.toml` in the user's config directory. Every field has a default, so an older or
+/// partial file still loads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
-    #[serde(default)]
+    /// Theme name (`chiika`, `midnight`).
+    pub theme: String,
+    /// Shell started by `n`, by label (`pwsh`, `cmd`, `wsl`, `bash`…); `None` = first found.
+    pub shell: Option<String>,
+    pub sidebar: SidebarPref,
+    /// Load chiika's shell integration (PowerShell, bash, zsh).
+    pub shell_integration: bool,
+    pub keys: KeysConfig,
     pub agents: Agents,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            theme: "chiika".into(),
+            shell: None,
+            sidebar: SidebarPref::Open,
+            shell_integration: true,
+            keys: KeysConfig::default(),
+            agents: Agents::default(),
+        }
+    }
 }
 
 /// One team box of the canvas.
@@ -89,9 +151,13 @@ mod tests {
     fn config_round_trips() {
         let path = temp_file("config.toml");
         let config = Config {
+            theme: "midnight".into(),
+            shell: Some("cmd".into()),
+            sidebar: SidebarPref::Collapsed,
             agents: Agents {
                 claude: Some(AgentChoice::Connected),
             },
+            ..Config::default()
         };
         save(&path, &config).unwrap();
         assert!(
@@ -100,6 +166,23 @@ mod tests {
                 .contains("claude = \"connected\"")
         );
         assert_eq!(load::<Config>(&path), config);
+    }
+
+    #[test]
+    fn an_older_or_partial_config_keeps_the_defaults() {
+        let path = temp_file("partial.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[agents]\nclaude = \"declined\"\n[keys]\nleave = \"ctrl+w\"\n",
+        )
+        .unwrap();
+        let config: Config = load(&path);
+        assert_eq!(config.agents.claude, Some(AgentChoice::Declined));
+        assert_eq!(config.keys.leave, "ctrl+w");
+        assert_eq!(config.keys.pane_left, "alt+left");
+        assert_eq!(config.theme, "chiika");
+        assert!(config.shell_integration);
     }
 
     #[test]

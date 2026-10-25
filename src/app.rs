@@ -12,19 +12,17 @@ use ratatui::layout::{Position, Rect};
 use crate::agent::{self, AgentInfo, AgentState};
 use crate::canvas::{self, CanvasState};
 use crate::channel::{self, HookEvent, Reply, Request};
-use crate::config::{self, AgentChoice, CanvasFile, Config, TeamEntry};
+use crate::config::{self, AgentChoice, CanvasFile, Config, SidebarPref, TeamEntry};
 use crate::coord;
 use crate::fx::{format_duration, fuzzy_match};
-use crate::keys::{encode_key, encode_paste};
+use crate::keys::{Keys, chord_matches, encode_key, encode_paste};
 use crate::layout::{Dir, Layout, Split};
 use crate::link::{self, Link};
 use crate::protocol::{ClientMsg, Launch, MarksSnapshot, SessionInfo};
 use crate::session::{Session, Status};
+use crate::shell::Integration;
 use crate::theme::{THEMES, Theme};
 use crate::ui;
-
-/// Key that leaves Terminal mode; never forwarded to the PTY.
-pub const LEAVE_TERMINAL: (KeyCode, KeyModifiers) = (KeyCode::Char('q'), KeyModifiers::CONTROL);
 
 /// Lines scrolled per mouse wheel notch.
 const WHEEL_LINES: usize = 3;
@@ -139,6 +137,8 @@ pub enum Action {
     Prev,
     /// Scroll the history one page; `true` = towards older output.
     ScrollPage(bool),
+    /// Scroll to the previous (`true`) or next prompt of the history.
+    JumpPrompt(bool),
     InputChar(char),
     InputBackspace,
     Confirm,
@@ -161,6 +161,15 @@ pub enum Target {
 }
 
 /// A sidebar folder, which is also a team box of the canvas.
+/// A sidebar card held by the mouse; it becomes a drag once the pointer moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidebarDrag {
+    pub session: u32,
+    pub from: Position,
+    pub pointer: Position,
+    pub dragging: bool,
+}
+
 pub struct Folder {
     pub id: u32,
     pub name: String,
@@ -223,6 +232,10 @@ pub enum MenuAction {
     /// New team at this canvas position.
     NewTeamAt(i32, i32),
     ToggleClaude,
+    /// Opens the menu of shells for `n`.
+    ShellMenu,
+    SetShell(&'static str),
+    ToggleIntegration,
     /// Opens the role menu to add an agent to this team.
     AgentRoles(u32),
     /// Team, index in `agent::ROLES`.
@@ -274,8 +287,8 @@ pub struct ShellSpec {
     /// `None` = the user's default shell (`$SHELL`).
     prog: Option<&'static str>,
     args: &'static [&'static str],
-    /// PowerShell: load chiika's shell integration (see `shell.rs`).
-    integrated: bool,
+    /// The shell integration it can load; the default shell's comes from `$SHELL`.
+    integration: Option<Integration>,
 }
 
 /// Known shells; `n` starts the first one that spawns, the palette offers each of them.
@@ -285,25 +298,25 @@ const SHELLS: &[ShellSpec] = &[
         label: "pwsh",
         prog: Some("pwsh.exe"),
         args: &["-NoLogo"],
-        integrated: true,
+        integration: Some(Integration::PowerShell),
     },
     ShellSpec {
         label: "powershell",
         prog: Some("powershell.exe"),
         args: &["-NoLogo"],
-        integrated: true,
+        integration: Some(Integration::PowerShell),
     },
     ShellSpec {
         label: "cmd",
         prog: Some("cmd.exe"),
         args: &[],
-        integrated: false,
+        integration: None,
     },
     ShellSpec {
         label: "wsl",
         prog: Some("wsl.exe"),
         args: &[],
-        integrated: false,
+        integration: Some(Integration::Wsl),
     },
 ];
 #[cfg(not(windows))]
@@ -312,25 +325,25 @@ const SHELLS: &[ShellSpec] = &[
         label: "shell",
         prog: None,
         args: &[],
-        integrated: false,
+        integration: None,
     },
     ShellSpec {
         label: "bash",
         prog: Some("bash"),
         args: &[],
-        integrated: false,
+        integration: Some(Integration::Bash),
     },
     ShellSpec {
         label: "zsh",
         prog: Some("zsh"),
         args: &[],
-        integrated: false,
+        integration: Some(Integration::Zsh),
     },
     ShellSpec {
         label: "fish",
         prog: Some("fish"),
         args: &[],
-        integrated: false,
+        integration: None,
     },
 ];
 
@@ -374,6 +387,10 @@ pub struct App {
     pub detach: bool,
     /// Printed once the terminal is restored.
     exit_note: Option<String>,
+    /// The pane border being dragged.
+    pane_drag: Option<crate::layout::Divider>,
+    /// A sidebar card held by the mouse.
+    pub sidebar_drag: Option<SidebarDrag>,
     /// The chiika executable long-lived helpers run (a copy, see `link::stable_copy`).
     tool_exe: Option<PathBuf>,
     /// The daemon found runs another build of chiika and has sessions: ask what to do.
@@ -386,6 +403,8 @@ pub struct App {
     next_folder: u32,
     last_click: Option<(Instant, usize)>,
     theme: usize,
+    /// Keys taken even inside a shell, from the config.
+    pub keys: Keys,
     area: Rect,
     tx: Sender<AppEvent>,
 }
@@ -425,6 +444,8 @@ impl App {
             hooks: None,
             detach: false,
             exit_note: None,
+            pane_drag: None,
+            sidebar_drag: None,
             tool_exe: None,
             stale_daemon: false,
             pending: HashMap::new(),
@@ -433,12 +454,14 @@ impl App {
             next_folder: 1,
             last_click: None,
             theme: 0,
+            keys: Keys::default(),
             area,
             tx,
         };
+        app.apply_config();
         app.connect_daemon(true);
         if app.sessions.is_empty() {
-            app.new_session(&available_shells(), Place::Replace);
+            app.new_session(&app.shells(), Place::Replace);
         }
         // Start typing straight into the first shell, like tmux.
         if !app.sessions.is_empty() {
@@ -508,7 +531,7 @@ impl App {
         }
         self.connect_daemon(false);
         if self.sessions.is_empty() {
-            self.new_session(&available_shells(), Place::Replace);
+            self.new_session(&self.shells(), Place::Replace);
         }
         if !self.sessions.is_empty() {
             self.mode = Mode::Terminal;
@@ -686,11 +709,50 @@ impl App {
 
     fn set_claude(&mut self, choice: AgentChoice) {
         self.config.agents.claude = Some(choice);
+        self.save_config();
+    }
+
+    /// Theme, sidebar and keys from the config; unreadable keys are reported.
+    fn apply_config(&mut self) {
+        self.theme = THEMES
+            .iter()
+            .position(|t| t.name == self.config.theme)
+            .unwrap_or(0);
+        self.sidebar_collapsed = self.config.sidebar == SidebarPref::Collapsed;
+        let (keys, errors) = Keys::from_config(&self.config.keys);
+        self.keys = keys;
+        if !errors.is_empty() {
+            self.status_msg = Some(format!(
+                "config: unreadable keys, defaults kept: {}",
+                errors.join(", ")
+            ));
+        }
+    }
+
+    fn save_config(&mut self) {
         if let Some(path) = &self.paths.config
             && let Err(e) = config::save(path, &self.config)
         {
             self.status_msg = Some(format!("cannot save the settings: {e:#}"));
         }
+    }
+
+    fn set_theme(&mut self, index: usize) {
+        self.theme = index;
+        self.config.theme = THEMES[index].name.to_string();
+        self.save_config();
+    }
+
+    /// The shells `n` tries, the configured one first.
+    fn shells(&self) -> Vec<&'static ShellSpec> {
+        let mut shells = available_shells();
+        if let Some(wanted) = &self.config.shell
+            && let Some(i) = shells.iter().position(|s| s.label == wanted)
+        {
+            let shell = shells.remove(i);
+            shells.insert(0, shell);
+        }
+        shells
     }
 
     pub(crate) fn set_view(&mut self, view: View) {
@@ -1004,7 +1066,25 @@ impl App {
 
     fn toggle_sidebar(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.config.sidebar = if self.sidebar_collapsed {
+            SidebarPref::Collapsed
+        } else {
+            SidebarPref::Open
+        };
+        self.save_config();
         self.relayout();
+    }
+
+    /// Scrolls the focused shell to its previous or next prompt.
+    fn jump_prompt(&mut self, up: bool) {
+        let Some(session) = self.focused.and_then(|id| self.session(id)) else {
+            return;
+        };
+        let moved = crate::shell::jump_prompt(&mut session.parser.lock().unwrap(), up);
+        if !moved && !session.marks(|m| m.integrated) {
+            self.status_msg =
+                Some("jumping between commands needs a shell chiika integrates".into());
+        }
     }
 
     /// Gives the keyboard to the pane of session `id` and moves the sidebar cursor to it.
@@ -1058,7 +1138,8 @@ impl App {
         let app_cursor = self
             .focused_screen(|screen| screen.application_cursor())
             .unwrap_or(false);
-        let action = key_action(self.mode, key, !self.sessions.is_empty(), app_cursor);
+        let has_session = !self.sessions.is_empty();
+        let action = key_action_with(&self.keys, self.mode, key, has_session, app_cursor);
         if action != Action::None && self.mode != Mode::Terminal {
             self.status_msg = None;
         }
@@ -1084,7 +1165,8 @@ impl App {
                 self.menu = None;
                 self.rename = None;
             }
-            Action::New => self.new_session(&available_shells(), Place::Replace),
+            Action::New => self.new_session(&self.shells(), Place::Replace),
+            Action::JumpPrompt(up) => self.jump_prompt(up),
             Action::Palette(query) => {
                 self.input = query.to_string();
                 self.picked = 0;
@@ -1233,7 +1315,7 @@ impl App {
                 let id = self.new_folder();
                 self.start_rename(Target::Folder(id));
             }
-            Command::Split(dir) => self.new_session(&available_shells(), Place::Split(dir)),
+            Command::Split(dir) => self.new_session(&self.shells(), Place::Split(dir)),
             Command::ClosePane => {
                 if let Some(id) = self.focused {
                     self.close_pane(id);
@@ -1244,7 +1326,7 @@ impl App {
                 View::Terminals => View::Canvas,
                 View::Canvas => View::Terminals,
             }),
-            Command::Theme(index) => self.theme = index,
+            Command::Theme(index) => self.set_theme(index),
             Command::Quit => self.ask_quit(),
         }
     }
@@ -1263,7 +1345,7 @@ impl App {
             }
             MenuAction::Split(id, dir) => {
                 self.focus(id);
-                self.new_session(&available_shells(), Place::Split(dir));
+                self.new_session(&self.shells(), Place::Split(dir));
             }
             MenuAction::ClosePane(id) => self.close_pane(id),
             MenuAction::Settings => self.open_menu(self.settings_menu(), at),
@@ -1279,7 +1361,17 @@ impl App {
                 self.detach = false;
                 self.should_quit = true;
             }
-            MenuAction::SetTheme(index) => self.theme = index,
+            MenuAction::SetTheme(index) => self.set_theme(index),
+            MenuAction::ShellMenu => self.open_menu(self.shell_menu(), at),
+            MenuAction::SetShell(label) => {
+                self.config.shell = Some(label.to_string());
+                self.save_config();
+            }
+            MenuAction::ToggleIntegration => {
+                self.config.shell_integration = !self.config.shell_integration;
+                self.save_config();
+                self.status_msg = Some("applies to the shells started from now on".into());
+            }
             MenuAction::ToggleSidebar => self.toggle_sidebar(),
             MenuAction::EditConsigne(id) => self.edit_consigne(id),
             MenuAction::OpenBoard(id) => self.open_board(id),
@@ -1629,7 +1721,33 @@ impl App {
             _ => "connect claude code",
         };
         items.push((claude.into(), MenuAction::ToggleClaude));
+        let shell = self.shells().first().map_or("none", |s| s.label);
+        items.push((format!("default shell: {shell} ›"), MenuAction::ShellMenu));
+        let integration = if self.config.shell_integration {
+            "shell integration: on ✓"
+        } else {
+            "shell integration: off"
+        };
+        items.push((integration.into(), MenuAction::ToggleIntegration));
         items
+    }
+
+    fn shell_menu(&self) -> Vec<(String, MenuAction)> {
+        let current = self.shells().first().map(|s| s.label);
+        available_shells()
+            .into_iter()
+            .map(|shell| {
+                let mark = if Some(shell.label) == current {
+                    " ✓"
+                } else {
+                    ""
+                };
+                (
+                    format!("{}{mark}", shell.label),
+                    MenuAction::SetShell(shell.label),
+                )
+            })
+            .collect()
     }
 
     /// Opens the app menu just above its button.
@@ -1812,6 +1930,29 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.left_click(pos),
             MouseEventKind::Down(MouseButton::Right) => self.right_click(pos),
+            MouseEventKind::Drag(MouseButton::Left) if self.sidebar_drag.is_some() => {
+                if let Some(drag) = &mut self.sidebar_drag {
+                    drag.pointer = pos;
+                    drag.dragging |= pos != drag.from;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.sidebar_drag.is_some() => {
+                if let Some(drag) = self.sidebar_drag.take()
+                    && drag.dragging
+                    && let Some((_, team)) = self.sidebar_drop(pos)
+                {
+                    self.move_to(drag.session, team);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.pane_drag.is_some() => {
+                if let (Some(divider), Some(layout)) = (self.pane_drag, self.layout.as_mut()) {
+                    layout.set_share(divider.index, divider.share_at(pos));
+                    self.relayout();
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.pane_drag.is_some() => {
+                self.pane_drag = None;
+            }
             MouseEventKind::Drag(MouseButton::Left) if self.canvas.grab.is_some() => {
                 self.canvas_drag(pos)
             }
@@ -1837,6 +1978,23 @@ impl App {
         let inside = pos.x > rect.x && pos.x + 1 < rect.right();
         let index = usize::from(pos.y.checked_sub(rect.y + 1)?);
         (inside && index < menu.items.len()).then_some(index)
+    }
+
+    /// Where a card dropped at `pos` goes: the row to highlight, if any, and the team (`None`:
+    /// out of any team). `None` outside the list: the drop is cancelled.
+    pub fn sidebar_drop(&self, pos: Position) -> Option<(Option<usize>, Option<u32>)> {
+        let (sidebar, _, _) = self.screen();
+        if !ui::cards_area(sidebar).contains(pos) {
+            return None;
+        }
+        let Some(index) = self.row_at(pos) else {
+            return Some((None, None));
+        };
+        let team = match self.rows().get(index)? {
+            Row::Folder(id) => Some(*id),
+            Row::Session(id) => self.session(*id)?.folder,
+        };
+        Some((Some(index), team))
     }
 
     /// Sidebar row under `pos`, by index.
@@ -1900,7 +2058,15 @@ impl App {
             match self.cursor_row() {
                 Some(Row::Folder(id)) => self.toggle_folder(id),
                 Some(Row::Session(id)) if double => self.start_rename(Target::Session(id)),
-                Some(Row::Session(id)) => self.show_session(id),
+                Some(Row::Session(id)) => {
+                    self.show_session(id);
+                    self.sidebar_drag = Some(SidebarDrag {
+                        session: id,
+                        from: pos,
+                        pointer: pos,
+                        dragging: false,
+                    });
+                }
                 None => {}
             }
             return;
@@ -1909,6 +2075,14 @@ impl App {
             if self.main_area().contains(pos) {
                 self.canvas_press(pos);
             }
+            return;
+        }
+        let border = self
+            .layout
+            .as_ref()
+            .and_then(|l| l.divider_at(self.main_area(), pos));
+        if border.is_some() {
+            self.pane_drag = border;
             return;
         }
         let pane = self
@@ -1999,10 +2173,12 @@ impl App {
                 return;
             }
         };
+        let scripts = self.paths.project.as_ref().map(|p| p.join("shell"));
         let mut last_err = anyhow::anyhow!("no shell found");
         for shell in shells {
             let name = format!("{} {}", shell.label, self.next_id);
-            match self.spawn_session(name, shell.launch(&cwd), place) {
+            let launch = shell.launch(&cwd, self.config.shell_integration, scripts.as_deref());
+            match self.spawn_session(name, launch, place) {
                 Ok(id) => {
                     tracing::info!(id, shell = shell.label, "session started");
                     return;
@@ -2085,22 +2261,31 @@ impl App {
 }
 
 impl ShellSpec {
-    fn launch(&self, cwd: &Path) -> Launch {
-        let mut argv: Vec<String> = self
-            .prog
+    /// `scripts`: where bash and zsh integration scripts go (`.chiika/shell`), `None` without a
+    /// project.
+    fn launch(&self, cwd: &Path, integrate: bool, scripts: Option<&Path>) -> Launch {
+        // The default shell is named, to be given its integration.
+        let default = || std::env::var("SHELL").ok();
+        let (prog, integration) = match self.prog {
+            Some(prog) => (Some(prog.to_string()), self.integration),
+            None if integrate => {
+                let prog = default();
+                let integration = prog.as_deref().and_then(Integration::of_prog);
+                (prog.filter(|_| integration.is_some()), integration)
+            }
+            None => (None, None),
+        };
+        let argv = prog
             .into_iter()
-            .chain(self.args.iter().copied())
-            .map(String::from)
+            .chain(self.args.iter().map(|a| a.to_string()))
             .collect();
-        if self.integrated {
-            // After the user's profile: wraps their prompt, survives their settings.
-            argv.extend([
-                "-NoExit".into(),
-                "-EncodedCommand".into(),
-                crate::shell::encoded_command(),
-            ]);
+        let mut launch = Launch::new(argv, cwd.to_path_buf());
+        if let Some(integration) = integration.filter(|_| integrate)
+            && let Err(e) = integration.apply(&mut launch, scripts)
+        {
+            tracing::warn!(shell = self.label, "shell integration not loaded: {e}");
         }
-        Launch::new(argv, cwd.to_path_buf())
+        launch
     }
 }
 
@@ -2169,28 +2354,46 @@ pub fn build_rows(folders: &[Folder], sessions: &[(u32, Option<u32>)]) -> Vec<Ro
     rows
 }
 
-/// Maps a key event to an action, without side effects.
+/// `key_action_with` and the default keys.
+#[cfg(test)]
 pub fn key_action(mode: Mode, key: KeyEvent, has_session: bool, app_cursor: bool) -> Action {
+    key_action_with(&Keys::default(), mode, key, has_session, app_cursor)
+}
+
+/// Maps a key event to an action, without side effects; `keys` are the configured ones.
+pub fn key_action_with(
+    keys: &Keys,
+    mode: Mode,
+    key: KeyEvent,
+    has_session: bool,
+    app_cursor: bool,
+) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::None;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     // Single-letter commands only fire without Ctrl/Alt (Ctrl+Q must not quit chiika).
     let plain = !ctrl && !alt;
     // Ctrl+Alt is AltGr on Windows ('@', '{', '|'…).
     let altgr = ctrl && alt;
-    let pane_dir = (key.modifiers == KeyModifiers::ALT)
-        .then(|| arrow_dir(key.code))
-        .flatten();
+    let is = |chord| chord_matches(chord, key);
+    let pane_dir = [
+        (keys.pane_left, Dir::Left),
+        (keys.pane_right, Dir::Right),
+        (keys.pane_up, Dir::Up),
+        (keys.pane_down, Dir::Down),
+    ]
+    .into_iter()
+    .find_map(|(chord, dir)| is(chord).then_some(dir));
+    let shell_side = matches!(mode, Mode::Workspace | Mode::Terminal);
     match mode {
-        Mode::Terminal if is_leave(key) => Action::Leave,
-        Mode::Workspace | Mode::Terminal if pane_dir.is_some() => {
-            Action::FocusPane(pane_dir.expect("checked"))
-        }
-        Mode::Terminal if shift && key.code == KeyCode::PageUp => Action::ScrollPage(true),
-        Mode::Terminal if shift && key.code == KeyCode::PageDown => Action::ScrollPage(false),
+        Mode::Terminal if is(keys.leave) => Action::Leave,
+        _ if shell_side && pane_dir.is_some() => Action::FocusPane(pane_dir.expect("checked")),
+        _ if shell_side && is(keys.prev_command) => Action::JumpPrompt(true),
+        _ if shell_side && is(keys.next_command) => Action::JumpPrompt(false),
+        Mode::Terminal if is(keys.scroll_up) => Action::ScrollPage(true),
+        Mode::Terminal if is(keys.scroll_down) => Action::ScrollPage(false),
         Mode::Terminal => encode_key(key, app_cursor).map_or(Action::None, Action::Send),
         Mode::Workspace => match key.code {
             KeyCode::Enter if has_session => Action::Focus,
@@ -2274,24 +2477,6 @@ pub fn truncate(text: &str, max: usize) -> String {
     let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
     cut.push('…');
     cut
-}
-
-fn arrow_dir(code: KeyCode) -> Option<Dir> {
-    match code {
-        KeyCode::Left => Some(Dir::Left),
-        KeyCode::Right => Some(Dir::Right),
-        KeyCode::Up => Some(Dir::Up),
-        KeyCode::Down => Some(Dir::Down),
-        _ => None,
-    }
-}
-
-fn is_leave(key: KeyEvent) -> bool {
-    let code = match key.code {
-        KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
-        code => code,
-    };
-    (code, key.modifiers - KeyModifiers::SHIFT) == LEAVE_TERMINAL
 }
 
 fn step(selected: usize, len: usize, down: bool) -> usize {
@@ -2675,6 +2860,40 @@ mod tests {
         );
         assert_eq!(consigne_excerpt("# only a title\n"), None);
         assert_eq!(consigne_excerpt(""), None);
+    }
+
+    #[test]
+    fn configured_keys_replace_the_defaults() {
+        let config = crate::config::KeysConfig {
+            leave: "ctrl+w".into(),
+            prev_command: "ctrl+up".into(),
+            ..crate::config::KeysConfig::default()
+        };
+        let (keys, _) = Keys::from_config(&config);
+        let act = |code, mods| key_action_with(&keys, Mode::Terminal, key(code, mods), true, false);
+        assert_eq!(
+            act(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            Action::Leave
+        );
+        assert_eq!(
+            act(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            Action::Send(vec![0x11]),
+            "the old key goes to the shell"
+        );
+        assert_eq!(
+            act(KeyCode::Up, KeyModifiers::CONTROL),
+            Action::JumpPrompt(true)
+        );
+        assert_eq!(
+            key_action(
+                Mode::Terminal,
+                key(KeyCode::PageUp, KeyModifiers::ALT),
+                true,
+                false
+            ),
+            Action::JumpPrompt(true),
+            "default prev_command"
+        );
     }
 
     #[test]

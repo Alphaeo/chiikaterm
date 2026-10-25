@@ -203,6 +203,8 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarksSnapshot {
     pub integrated: bool,
+    #[serde(default)]
+    pub prompts: Vec<String>,
     pub cwd: Option<String>,
     /// Command text, started this long ago.
     pub running: Option<(String, u64)>,

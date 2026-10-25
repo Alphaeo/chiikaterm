@@ -493,6 +493,44 @@ mod tests {
         assert_eq!(activity.values(), [0, 0, 0, 0, 0, 0, 0, 4]);
     }
 
+    /// Runs `line` (which exits with 3) in an integrated shell and checks chiika saw it;
+    /// returns the shell's directory as reported.
+    fn assert_integration_reports(cmd: CommandBuilder, line: &str) -> String {
+        let (mut session, _rx) = spawn(cmd);
+        let wait = |session: &Session, what: &str, done: &dyn Fn(&ShellMarks) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !session.marks(done) {
+                let screen = session.parser.lock().unwrap().screen().contents();
+                assert!(
+                    Instant::now() < deadline,
+                    "timeout waiting for {what}, screen:\n{screen}"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+        wait(&session, "first prompt", &|m| {
+            m.integrated && m.cwd.is_some()
+        });
+        session.write(format!("{line}\r").as_bytes()).unwrap();
+        wait(&session, "command end", &|m| m.last.is_some());
+        let last = session.marks(|m| m.last.clone()).unwrap();
+        assert_eq!(last.text, line);
+        assert_eq!(last.code, 3);
+        assert_eq!(session.take_finished().len(), 1);
+        assert!(!session.is_busy(Instant::now()));
+        session.kill();
+        session.marks(|m| m.cwd.clone()).unwrap()
+    }
+
+    /// The bash or zsh `prog` with chiika's integration, its scripts in a fresh folder.
+    fn integrated(prog: &str, integration: crate::shell::Integration) -> CommandBuilder {
+        let dir = std::env::temp_dir().join(format!("chiika-{prog}-{}", std::process::id()));
+        let mut launch = crate::protocol::Launch::new(vec![prog.into()], dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        integration.apply(&mut launch, Some(&dir)).unwrap();
+        launch.to_command()
+    }
+
     #[cfg(windows)]
     #[test]
     fn powershell_integration_reports_commands_and_cwd() {
@@ -505,24 +543,40 @@ mod tests {
             "-EncodedCommand",
             &script,
         ]);
-        let (mut session, _rx) = spawn(cmd);
-        let wait = |session: &Session, what: &str, done: &dyn Fn(&ShellMarks) -> bool| {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while !session.marks(done) {
-                assert!(Instant::now() < deadline, "timeout waiting for {what}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        };
-        wait(&session, "first prompt", &|m| {
-            m.integrated && m.cwd.is_some()
-        });
-        session.write(b"cmd /c exit 3\r").unwrap();
-        wait(&session, "command end", &|m| m.last.is_some());
-        let last = session.marks(|m| m.last.clone()).unwrap();
-        assert_eq!(last.text, "cmd /c exit 3");
-        assert_eq!(last.code, 3);
-        assert_eq!(session.take_finished().len(), 1);
-        assert!(!session.is_busy(Instant::now()));
-        session.kill();
+        assert_integration_reports(cmd, "cmd /c exit 3");
+    }
+
+    // Linux only: macOS ships bash 3.2, without the PS0 the command line needs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bash_integration_reports_commands_and_cwd() {
+        let cmd = integrated("bash", crate::shell::Integration::Bash);
+        assert_integration_reports(cmd, "echo a; (exit 3)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_integration_reports_commands_and_cwd() {
+        if std::process::Command::new("zsh")
+            .arg("-c")
+            .arg(":")
+            .status()
+            .is_err()
+        {
+            eprintln!("zsh not installed, skipped");
+            return;
+        }
+        let cmd = integrated("zsh", crate::shell::Integration::Zsh);
+        assert_integration_reports(cmd, "echo a; (exit 3)");
+    }
+
+    // Needs a WSL distribution with bash: `cargo test -- --ignored` on a machine that has one.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn wsl_integration_reports_commands_and_cwd() {
+        let cmd = integrated("wsl.exe", crate::shell::Integration::Wsl);
+        let cwd = assert_integration_reports(cmd, "echo a; (exit 3)");
+        assert!(std::path::Path::new(&cwd).is_dir(), "a Windows path: {cwd}");
     }
 }

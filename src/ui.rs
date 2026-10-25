@@ -14,6 +14,7 @@ use crate::app::{
 };
 use crate::canvas;
 use crate::fx::{format_duration, gradient_border, sparkline, spinner, sweep};
+use crate::keys::{Keys, describe};
 use crate::mascot;
 use crate::session::{Session, Status};
 use crate::theme::Theme;
@@ -34,8 +35,8 @@ pub const RAIL_WIDTH: u16 = 4;
 /// Palette rows shown at once.
 const PALETTE_ROWS: usize = 8;
 
-/// Every key binding, by section: shown by the bindings window and `--help`.
-pub const BINDINGS: &[(&str, &[(&str, &str)])] = &[
+/// Fixed key bindings, by section; `bindings` adds the configurable ones.
+const BINDINGS: &[(&str, &[(&str, &str)])] = &[
     (
         "Workspace",
         &[
@@ -57,18 +58,13 @@ pub const BINDINGS: &[(&str, &[(&str, &str)])] = &[
             ("q", "quit, or detach (keep shells running)"),
         ],
     ),
-    (
-        "Terminal",
-        &[
-            ("Ctrl+Q", "back to the workspace"),
-            ("Shift+PgUp PgDn", "scroll the history"),
-        ],
-    ),
+    ("Terminal", &[]),
     (
         "Anywhere",
         &[
-            ("Alt+arrows", "switch pane"),
             ("mouse wheel", "scroll the pane under the mouse"),
+            ("drag a border", "resize panes"),
+            ("drag a card", "move a shell to another team (sidebar)"),
             ("click", "select / focus"),
             ("double-click", "rename a session"),
             ("right-click", "menu of a session, team, pane or canvas"),
@@ -81,6 +77,47 @@ pub const BINDINGS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
 ];
+
+/// Every key binding, by section, with the configured keys: the bindings window and `--help`.
+pub fn bindings(keys: &Keys) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
+    let pair = |a, b| format!("{} {}", describe(a), describe(b));
+    let configured = [
+        ("Terminal", describe(keys.leave), "back to the workspace"),
+        (
+            "Terminal",
+            pair(keys.scroll_up, keys.scroll_down),
+            "scroll the history",
+        ),
+        (
+            "Anywhere",
+            format!(
+                "{} {} {} {}",
+                describe(keys.pane_left),
+                describe(keys.pane_right),
+                describe(keys.pane_up),
+                describe(keys.pane_down)
+            ),
+            "switch pane",
+        ),
+        (
+            "Anywhere",
+            pair(keys.prev_command, keys.next_command),
+            "previous / next command in the history",
+        ),
+    ];
+    BINDINGS
+        .iter()
+        .map(|&(section, fixed)| {
+            let mut rows: Vec<(String, &'static str)> = configured
+                .iter()
+                .filter(|(s, _, _)| *s == section)
+                .map(|(_, keys, what)| (keys.clone(), *what))
+                .collect();
+            rows.extend(fixed.iter().map(|&(keys, what)| (keys.to_string(), what)));
+            (section, rows)
+        })
+        .collect()
+}
 
 /// Splits the screen into (sidebar, main area, status line).
 pub fn layout(area: Rect, sidebar_width: u16) -> (Rect, Rect, Rect) {
@@ -392,26 +429,47 @@ fn draw_sidebar(frame: &mut Frame, app: &App, sidebar: Rect, now: Instant) {
         frame.render_widget(hint.centered(), area);
         return;
     }
+    let target = app
+        .sidebar_drag
+        .filter(|drag| drag.dragging)
+        .and_then(|drag| app.sidebar_drop(drag.pointer))
+        .and_then(|(row, _)| row);
     for (i, rect) in visible_rows(&rows, app.cursor, area, compact) {
         let selected = i == app.cursor;
         let buf = frame.buffer_mut();
         if compact {
             draw_rail_icon(buf, rect, rows[i], selected, app, now);
-            continue;
+        } else {
+            match rows[i] {
+                Row::Folder(id) => {
+                    if let Some(folder) = app.folder(id) {
+                        draw_folder(buf, rect, folder, selected, app);
+                    }
+                }
+                Row::Session(id) => {
+                    if let Some(session) = app.session(id) {
+                        draw_card(buf, rect, session, selected, app, now);
+                    }
+                }
+            }
         }
-        match rows[i] {
-            Row::Folder(id) => {
-                if let Some(folder) = app.folder(id) {
-                    draw_folder(buf, rect, folder, selected, app);
-                }
-            }
-            Row::Session(id) => {
-                if let Some(session) = app.session(id) {
-                    draw_card(buf, rect, session, selected, app, now);
-                }
-            }
+        if target == Some(i) {
+            buf.set_style(rect, Style::new().add_modifier(Modifier::REVERSED));
         }
     }
+}
+
+/// "move pwsh 2 → backend" while a sidebar card is dragged.
+fn drag_note(app: &App) -> Option<String> {
+    let drag = app.sidebar_drag.filter(|drag| drag.dragging)?;
+    let name = &app.session(drag.session)?.name;
+    let Some((_, team)) = app.sidebar_drop(drag.pointer) else {
+        return Some(format!("move {name}: drop it on a team, or below the list"));
+    };
+    let team = team
+        .and_then(|id| app.folder(id))
+        .map_or("no team", |f| f.name.as_str());
+    Some(format!("move {name} → {team}"))
 }
 
 /// One row of the collapsed sidebar: the folder arrow or the session status icon.
@@ -762,15 +820,15 @@ fn draw_bindings(frame: &mut Frame, app: &App) {
     let theme = app.theme();
     let accent = theme.accents[0];
     let mut lines = Vec::new();
-    for (i, (section, keys)) in BINDINGS.iter().enumerate() {
+    for (i, (section, keys)) in bindings(&app.keys).into_iter().enumerate() {
         if i > 0 {
             lines.push(Line::raw(""));
         }
-        lines.push(Line::styled(*section, Style::new().fg(accent).bold()));
-        for (keys, what) in *keys {
+        lines.push(Line::styled(section, Style::new().fg(accent).bold()));
+        for (keys, what) in keys {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {keys:<18}"), Style::new().fg(theme.pill[2])),
-                Span::styled(*what, Style::new().fg(theme.text)),
+                Span::styled(what, Style::new().fg(theme.text)),
             ]));
         }
     }
@@ -876,7 +934,14 @@ fn draw_status(frame: &mut Frame, app: &App, status: Rect, now: Instant) {
         Span::styled("▌ ", Style::new().fg(color)),
     ];
     let focused = app.focused.and_then(|id| app.session(id));
+    let drag = drag_note(app);
     match (&app.status_msg, focused) {
+        _ if drag.is_some() => {
+            left.push(Span::styled(
+                drag.unwrap_or_default(),
+                Style::new().fg(theme.text),
+            ));
+        }
         _ if app.mode == Mode::Rename => left.extend([
             Span::styled("❯ ", Style::new().fg(color)),
             Span::styled(app.input.as_str(), Style::new().fg(theme.text)),
@@ -905,12 +970,18 @@ fn draw_status(frame: &mut Frame, app: &App, status: Rect, now: Instant) {
         (None, None) => {}
     }
     let left = Line::from(left);
+    let terminal_hint = format!(
+        "{} workspace · {} scroll · {} commands ",
+        describe(app.keys.leave),
+        describe(app.keys.scroll_up),
+        describe(app.keys.prev_command),
+    );
     let hints = match app.mode {
         Mode::Workspace if app.view == View::Canvas => {
             "drag mascots · t team · Tab terminals · : palette "
         }
         Mode::Workspace => "| - split · w unsplit · Tab canvas · : palette ",
-        Mode::Terminal => "Ctrl+Q workspace · Alt+←→↑↓ panes · Shift+PgUp scroll ",
+        Mode::Terminal => terminal_hint.as_str(),
         Mode::Rename => "↵ save · Esc cancel ",
         Mode::Palette => "↑↓ choose · ↵ run · Esc close ",
         Mode::Menu => "↑↓ choose · ↵ run · Esc close ",
@@ -1101,6 +1172,59 @@ mod tests {
             }
         }
         app.kill_all();
+    }
+
+    #[test]
+    fn a_card_dragged_onto_a_team_joins_it() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(Rect::new(0, 0, 120, 40), tx, Paths::default());
+        app.mode = Mode::Workspace;
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Enter);
+        let shell = app.sessions[0].id;
+        let team = app.folders[0].id;
+        let rows = app.rows();
+        let sidebar = layout(Rect::new(0, 0, 120, 40), app.sidebar_width()).0;
+        let places = visible_rows(&rows, app.cursor, cards_area(sidebar), false);
+        let at = |row: Row| {
+            let index = rows.iter().position(|r| *r == row).unwrap();
+            let rect = places.iter().find(|(i, _)| *i == index).unwrap().1;
+            Position::new(rect.x + 3, rect.y)
+        };
+        let (card, header) = (at(Row::Session(shell)), at(Row::Folder(team)));
+        let mouse = |app: &mut App, kind, pos: Position| {
+            let event = MouseEvent {
+                kind,
+                column: pos.x,
+                row: pos.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.handle(AppEvent::Input(Event::Mouse(event)));
+        };
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), card);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), header);
+        assert_eq!(app.sidebar_drop(header), Some((Some(0), Some(team))));
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), header);
+        assert_eq!(app.session(shell).unwrap().folder, Some(team));
+
+        // Below the list: out of the team (after the double-click delay).
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        let below = Position::new(card.x, sidebar.bottom() - 12);
+        let card = at_row(&app, Row::Session(shell));
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), card);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), below);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), below);
+        assert_eq!(app.session(shell).unwrap().folder, None);
+        app.kill_all();
+    }
+
+    fn at_row(app: &App, row: Row) -> Position {
+        let rows = app.rows();
+        let sidebar = layout(Rect::new(0, 0, 120, 40), app.sidebar_width()).0;
+        let places = visible_rows(&rows, app.cursor, cards_area(sidebar), false);
+        let index = rows.iter().position(|r| *r == row).unwrap();
+        let rect = places.iter().find(|(i, _)| *i == index).unwrap().1;
+        Position::new(rect.x + 3, rect.y)
     }
 
     #[test]

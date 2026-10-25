@@ -41,9 +41,9 @@ fn usage() -> String {
     let mut text = String::from(
         "Usage: chiika [--version | --help]\nOpens a terminal workspace with several shells.\n",
     );
-    for (section, keys) in ui::BINDINGS {
+    for (section, keys) in ui::bindings(&keys::Keys::default()) {
         text += &format!("\n{section}\n");
-        for (keys, what) in *keys {
+        for (keys, what) in keys {
             text += &format!("  {keys:<18}{what}\n");
         }
     }

@@ -19,8 +19,10 @@ them while you watch.
 
 - **Terminals**: real shells (PowerShell, cmd, WSL, bash…) in split panes, with scrollback,
   mouse, renaming, and a command palette (`:`).
-- **Shell integration** (PowerShell): chiika knows when a command starts, ends, how long it
-  took and whether it failed; a notification pops when a long command ends in another shell.
+- **Shell integration** (PowerShell, bash, zsh, WSL): chiika knows when a command starts, ends,
+  how long it took and whether it failed; a notification pops when a long command ends in
+  another shell, and `Alt+PgUp` / `Alt+PgDn` jump from command to command in the history.
+  Your profile and `~/.bashrc` / `~/.zshrc` are loaded as usual and never modified.
 - **Canvas** (`Tab`): every shell is a mascot showing its real state; drag them into **teams**,
   each with its own instructions (`TEAM.md`).
 - **Claude Code agents**: add a `lead`, `coder`, `reviewer` or `tester` to a team. Each agent
@@ -107,6 +109,29 @@ and, for you, `%APPDATA%\chiika\config.toml`. Delete them if you want no trace l
 | Canvas | drag mascots into teams · `t` new team · right-click a team › `add agent…` |
 
 Quitting with `q` asks whether to **detach** (everything keeps running) or **close all**.
+
+Drag the border between two panes to resize them, and drag a shell onto a team in the sidebar
+to move it there.
+
+## Settings
+
+`%APPDATA%\chiika\config.toml` (`~/.config/chiika/config.toml` elsewhere) keeps what you change
+in chiika (theme, default shell, sidebar). Every line is optional:
+
+```toml
+theme = "chiika"            # or "midnight"
+shell = "pwsh"              # shell started by `n`: pwsh, powershell, cmd, wsl (bash, zsh… elsewhere)
+sidebar = "open"            # or "collapsed"
+shell_integration = true
+
+[keys]                      # keys chiika takes even inside a shell
+leave = "ctrl+q"
+pane_left = "alt+left"      # pane_right, pane_up, pane_down
+scroll_up = "shift+pageup"  # scroll_down
+prev_command = "alt+pageup" # next_command
+```
+
+A key chiika cannot read keeps its default, and the status bar says so.
 
 ## Working with agents
 
