@@ -21,3 +21,9 @@ install-updater = false
 cargo-cyclonedx = true
 # GitHub attests that each artifact was built by this workflow from this commit
 github-attestations = true
+# Pull requests build every artifact too (downloadable from the run, never published)
+pr-run-mode = "upload"
+
+# Windows ARM on a Windows runner: the MSI needs WiX, which Linux runners lack
+[dist.github-custom-runners]
+aarch64-pc-windows-msvc = "windows-2022"
