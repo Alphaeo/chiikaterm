@@ -1,0 +1,40 @@
+name: Bug report
+description: Something does not work as it should
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: chiika version
+      description: The output of `chiika --version`
+      placeholder: chiika 0.1.0 (ccaec7a)
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System and terminal
+      placeholder: Windows 11, Windows Terminal 1.22, PowerShell 7.5
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `chiika` in …
+        2. Press …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run chiika with `$env:CHIIKA_LOG="chiika.log"` (PowerShell) or `CHIIKA_LOG=chiika.log` (sh), reproduce, then paste the end of `chiika.log` (and `chiika.log.daemon` for shells or agents). Check that it holds nothing private.
+      render: text

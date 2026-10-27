@@ -3,10 +3,17 @@ name = "chiika"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+authors = ["Alphaeo"]
 license = "MIT OR Apache-2.0"
 description = "A terminal workspace for shells and coding agents, with a canvas of teams"
 repository = "https://github.com/Alphaeo/chiikaterm"
 readme = "README.md"
+
+[package.metadata.wix]
+upgrade-guid = "9141224D-18DF-4DA4-8DE0-6BAE69CC8193"
+path-guid = "43C975BC-8865-4C6F-BF67-534157EEEF5B"
+license = false
+eula = false
 
 [dependencies]
 anyhow = "1"
@@ -19,3 +26,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tui-term = "0.3"
 vt100 = "0.16"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

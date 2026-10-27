@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     match args.as_slice() {
         [] => {}
         [a] if a == "--version" || a == "-V" => {
-            println!("chiika {}", env!("CARGO_PKG_VERSION"));
+            println!("chiika {}", env!("CHIIKA_VERSION"));
             return Ok(());
         }
         // Started by chiika: hosts the project's sessions in the background.
@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     init_logging("")?;
-    tracing::info!("starting chiika {}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("starting chiika {}", env!("CHIIKA_VERSION"));
 
     let mut terminal = ratatui::init();
     let ratatui_hook = std::panic::take_hook();

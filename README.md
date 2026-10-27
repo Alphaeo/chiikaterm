@@ -209,7 +209,8 @@ cargo run
 ```
 
 `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` are what CI
-runs.
+runs. See [CONTRIBUTING.md](CONTRIBUTING.md) to send a change, [CHANGELOG.md](CHANGELOG.md) for
+what changed, and [SECURITY.md](SECURITY.md) to report a vulnerability privately.
 
 ## License
 
