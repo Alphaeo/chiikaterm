@@ -21,3 +21,5 @@ install-updater = false
 cargo-cyclonedx = true
 # GitHub attests that each artifact was built by this workflow from this commit
 github-attestations = true
+# Pull requests build every artifact too (downloadable from the run, never published)
+pr-run-mode = "upload"
