@@ -137,7 +137,7 @@ pub enum ClientMsg {
         name: String,
         folder: Option<u32>,
         ephemeral: bool,
-        agent: Option<AgentSnapshot>,
+        agent: Option<Box<AgentSnapshot>>,
     },
     /// Answer the permission request held for agent `id`: allow, deny, or `None` to let the
     /// agent ask in its terminal.
@@ -203,6 +203,8 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarksSnapshot {
     pub integrated: bool,
+    #[serde(default)]
+    pub prompts: Vec<String>,
     pub cwd: Option<String>,
     /// Command text, started this long ago.
     pub running: Option<(String, u64)>,
@@ -230,6 +232,14 @@ pub struct AgentSnapshot {
     pub files: Vec<String>,
     /// How long chiika has held its permission request, if it does.
     pub permission_ms: Option<u64>,
+    #[serde(default)]
+    pub conversation: Option<String>,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub team_name: String,
+    #[serde(default)]
+    pub rules: usize,
 }
 
 #[cfg(test)]

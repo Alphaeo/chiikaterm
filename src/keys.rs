@@ -74,9 +74,216 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// A key with its modifiers, as written in the config (`"ctrl+q"`, `"alt+left"`, `"f12"`).
+pub type Chord = (KeyCode, KeyModifiers);
+
+/// Reads a chord; `None` if a part is unknown or there is not exactly one key.
+pub fn parse_chord(text: &str) -> Option<Chord> {
+    let mut modifiers = KeyModifiers::NONE;
+    let mut code = None;
+    for part in text.split('+').map(|p| p.trim().to_lowercase()) {
+        let key = match part.as_str() {
+            "ctrl" | "control" => {
+                modifiers |= KeyModifiers::CONTROL;
+                continue;
+            }
+            "alt" => {
+                modifiers |= KeyModifiers::ALT;
+                continue;
+            }
+            "shift" => {
+                modifiers |= KeyModifiers::SHIFT;
+                continue;
+            }
+            "left" => KeyCode::Left,
+            "right" => KeyCode::Right,
+            "up" => KeyCode::Up,
+            "down" => KeyCode::Down,
+            "pageup" | "pgup" => KeyCode::PageUp,
+            "pagedown" | "pgdn" => KeyCode::PageDown,
+            "home" => KeyCode::Home,
+            "end" => KeyCode::End,
+            "insert" => KeyCode::Insert,
+            "delete" | "del" => KeyCode::Delete,
+            "tab" => KeyCode::Tab,
+            "enter" => KeyCode::Enter,
+            "esc" | "escape" => KeyCode::Esc,
+            "backspace" => KeyCode::Backspace,
+            "space" => KeyCode::Char(' '),
+            f if f.len() > 1 && f.starts_with('f') => match f[1..].parse::<u8>() {
+                Ok(n @ 1..=12) => KeyCode::F(n),
+                _ => return None,
+            },
+            c if c.chars().count() == 1 => KeyCode::Char(c.chars().next()?),
+            _ => return None,
+        };
+        if code.replace(key).is_some() {
+            return None;
+        }
+    }
+    Some((code?, modifiers))
+}
+
+/// Whether `key` is `chord`. Letters ignore case and Shift (`Ctrl+Shift+Q` is `Ctrl+Q`), as the
+/// terminal reports them differently across layouts.
+pub fn chord_matches(chord: Chord, key: KeyEvent) -> bool {
+    let (code, modifiers) = chord;
+    match (code, key.code) {
+        (KeyCode::Char(want), KeyCode::Char(got)) => {
+            want.eq_ignore_ascii_case(&got)
+                && key.modifiers - KeyModifiers::SHIFT == modifiers - KeyModifiers::SHIFT
+        }
+        _ => code == key.code && key.modifiers == modifiers,
+    }
+}
+
+/// `Ctrl+Q`, `Alt+←`, `Shift+PgUp`.
+pub fn describe(chord: Chord) -> String {
+    let (code, modifiers) = chord;
+    let mut text = String::new();
+    for (flag, name) in [
+        (KeyModifiers::CONTROL, "Ctrl+"),
+        (KeyModifiers::ALT, "Alt+"),
+        (KeyModifiers::SHIFT, "Shift+"),
+    ] {
+        if modifiers.contains(flag) {
+            text.push_str(name);
+        }
+    }
+    let key = match code {
+        KeyCode::Left => "←".to_string(),
+        KeyCode::Right => "→".to_string(),
+        KeyCode::Up => "↑".to_string(),
+        KeyCode::Down => "↓".to_string(),
+        KeyCode::PageUp => "PgUp".to_string(),
+        KeyCode::PageDown => "PgDn".to_string(),
+        KeyCode::Char(' ') => "Space".to_string(),
+        KeyCode::Char(c) => c.to_ascii_uppercase().to_string(),
+        KeyCode::F(n) => format!("F{n}"),
+        other => format!("{other:?}"),
+    };
+    text + &key
+}
+
+/// The keys chiika takes for itself even inside a shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keys {
+    pub leave: Chord,
+    pub pane_left: Chord,
+    pub pane_right: Chord,
+    pub pane_up: Chord,
+    pub pane_down: Chord,
+    pub scroll_up: Chord,
+    pub scroll_down: Chord,
+    pub prev_command: Chord,
+    pub next_command: Chord,
+}
+
+impl Default for Keys {
+    fn default() -> Keys {
+        Keys::from_config(&crate::config::KeysConfig::default()).0
+    }
+}
+
+impl Keys {
+    /// The configured keys; an unreadable one keeps its default and is reported.
+    pub fn from_config(config: &crate::config::KeysConfig) -> (Keys, Vec<String>) {
+        let defaults = crate::config::KeysConfig::default();
+        let mut errors = Vec::new();
+        let mut read = |name: &str, text: &str, default: &str| {
+            parse_chord(text).unwrap_or_else(|| {
+                errors.push(format!("{name} = \"{text}\""));
+                parse_chord(default).expect("default keys are valid")
+            })
+        };
+        let keys = Keys {
+            leave: read("leave", &config.leave, &defaults.leave),
+            pane_left: read("pane_left", &config.pane_left, &defaults.pane_left),
+            pane_right: read("pane_right", &config.pane_right, &defaults.pane_right),
+            pane_up: read("pane_up", &config.pane_up, &defaults.pane_up),
+            pane_down: read("pane_down", &config.pane_down, &defaults.pane_down),
+            scroll_up: read("scroll_up", &config.scroll_up, &defaults.scroll_up),
+            scroll_down: read("scroll_down", &config.scroll_down, &defaults.scroll_down),
+            prev_command: read("prev_command", &config.prev_command, &defaults.prev_command),
+            next_command: read("next_command", &config.next_command, &defaults.next_command),
+        };
+        (keys, errors)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chords_are_read_from_text() {
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(parse_chord("ctrl+q"), Some((KeyCode::Char('q'), ctrl)));
+        assert_eq!(
+            parse_chord(" Ctrl + Shift + PageUp "),
+            Some((KeyCode::PageUp, ctrl | KeyModifiers::SHIFT))
+        );
+        assert_eq!(
+            parse_chord("alt+left"),
+            Some((KeyCode::Left, KeyModifiers::ALT))
+        );
+        assert_eq!(
+            parse_chord("f12"),
+            Some((KeyCode::F(12), KeyModifiers::NONE))
+        );
+        assert_eq!(parse_chord("ctrl+space"), Some((KeyCode::Char(' '), ctrl)));
+        assert_eq!(parse_chord("ctrl+"), None, "no key");
+        assert_eq!(parse_chord("ctrl+a+b"), None, "two keys");
+        assert_eq!(parse_chord("hyper+q"), None);
+        assert_eq!(parse_chord("f13"), None);
+    }
+
+    #[test]
+    fn letters_match_whatever_the_case_and_shift() {
+        let leave = parse_chord("ctrl+q").unwrap();
+        let ctrl = KeyModifiers::CONTROL;
+        assert!(chord_matches(
+            leave,
+            KeyEvent::new(KeyCode::Char('q'), ctrl)
+        ));
+        assert!(chord_matches(
+            leave,
+            KeyEvent::new(KeyCode::Char('Q'), ctrl | KeyModifiers::SHIFT)
+        ));
+        assert!(!chord_matches(
+            leave,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+        ));
+        let up = parse_chord("shift+pageup").unwrap();
+        assert!(chord_matches(
+            up,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)
+        ));
+        assert!(!chord_matches(
+            up,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn chords_are_described_for_people() {
+        assert_eq!(describe(parse_chord("ctrl+q").unwrap()), "Ctrl+Q");
+        assert_eq!(describe(parse_chord("alt+left").unwrap()), "Alt+←");
+        assert_eq!(describe(parse_chord("shift+pageup").unwrap()), "Shift+PgUp");
+    }
+
+    #[test]
+    fn bad_config_keys_fall_back_and_are_reported() {
+        let config = crate::config::KeysConfig {
+            leave: "ctrl+w".into(),
+            pane_left: "nope".into(),
+            ..crate::config::KeysConfig::default()
+        };
+        let (keys, errors) = Keys::from_config(&config);
+        assert_eq!(keys.leave, (KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(keys.pane_left, (KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(errors, ["pane_left = \"nope\""]);
+    }
 
     fn enc(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
         encode_key(KeyEvent::new(code, mods), false)

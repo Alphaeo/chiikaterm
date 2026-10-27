@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod audit;
 mod canvas;
 mod channel;
 mod config;
@@ -11,6 +12,7 @@ mod layout;
 mod link;
 mod mascot;
 mod mcp;
+mod policy;
 mod protocol;
 mod session;
 mod shell;
@@ -41,9 +43,9 @@ fn usage() -> String {
     let mut text = String::from(
         "Usage: chiika [--version | --help]\nOpens a terminal workspace with several shells.\n",
     );
-    for (section, keys) in ui::BINDINGS {
+    for (section, keys) in ui::bindings(&keys::Keys::default()) {
         text += &format!("\n{section}\n");
-        for (keys, what) in *keys {
+        for (keys, what) in keys {
             text += &format!("  {keys:<18}{what}\n");
         }
     }
@@ -55,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     match args.as_slice() {
         [] => {}
         [a] if a == "--version" || a == "-V" => {
-            println!("chiika {}", env!("CARGO_PKG_VERSION"));
+            println!("chiika {}", env!("CHIIKA_VERSION"));
             return Ok(());
         }
         // Started by chiika: hosts the project's sessions in the background.
@@ -89,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     init_logging("")?;
-    tracing::info!("starting chiika {}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("starting chiika {}", env!("CHIIKA_VERSION"));
 
     let mut terminal = ratatui::init();
     let ratatui_hook = std::panic::take_hook();

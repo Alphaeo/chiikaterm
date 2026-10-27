@@ -225,6 +225,28 @@ impl Session {
         }
     }
 
+    /// What the daemon sends of `parser` to an attaching client: its history, then its screen.
+    /// Replayed in a parser of the same size, the history lands in that parser's own.
+    pub fn screen_with_history(parser: &mut vt100::Parser<ShellMarks>) -> Vec<u8> {
+        let screen = parser.screen_mut();
+        let (rows, cols) = screen.size();
+        let mut out = Vec::new();
+        // ponytail: one offset per history line (1000 at most), each reading its top row.
+        screen.set_scrollback(usize::MAX);
+        for offset in (1..=screen.scrollback()).rev() {
+            screen.set_scrollback(offset);
+            out.extend(screen.rows_formatted(0, cols).next().unwrap_or_default());
+            out.extend(b"\x1b[m\r\n");
+        }
+        screen.set_scrollback(0);
+        // Pushes the last history lines off the screen, which the screen's state then repaints.
+        if !out.is_empty() {
+            out.extend(b"\r\n".repeat(usize::from(rows.saturating_sub(1))));
+        }
+        out.extend(screen.state_formatted());
+        out
+    }
+
     /// What the daemon tells an attaching client about this session; `screen` is its locked
     /// parser.
     pub fn info(&self, screen: &vt100::Parser<ShellMarks>, now: Instant) -> SessionInfo {
@@ -264,7 +286,10 @@ impl Session {
                 name: self.name.clone(),
                 folder: self.folder,
                 ephemeral: self.ephemeral,
-                agent: self.agent.as_ref().map(|agent| agent.snapshot(now)),
+                agent: self
+                    .agent
+                    .as_ref()
+                    .map(|agent| Box::new(agent.snapshot(now))),
             };
             if let Err(e) = link.send(&meta) {
                 tracing::warn!(id = self.id, "cannot update the daemon: {e}");
@@ -468,6 +493,40 @@ mod tests {
     }
 
     #[test]
+    fn history_and_screen_are_replayed() {
+        let mut daemon = vt100::Parser::new_with_callbacks(5, 20, 1000, ShellMarks::default());
+        for line in 1..=30 {
+            daemon.process(format!("\x1b[1mline {line}\x1b[m\r\n").as_bytes());
+        }
+        daemon.process(b"$ ls");
+        let bytes = Session::screen_with_history(&mut daemon);
+        let mut client = vt100::Parser::new_with_callbacks(5, 20, 1000, ShellMarks::default());
+        client.process(&bytes);
+
+        assert_eq!(client.screen().contents(), daemon.screen().contents());
+        assert_eq!(client.screen().cursor_position(), (4, 4));
+        let history = |p: &mut vt100::Parser<ShellMarks>| {
+            p.screen_mut().set_scrollback(usize::MAX);
+            let lines = p.screen().scrollback();
+            let top = p.screen().contents_formatted();
+            p.screen_mut().set_scrollback(0);
+            (lines, top)
+        };
+        let (lines, top) = history(&mut client);
+        assert_eq!((lines, top.clone()), history(&mut daemon));
+        assert!(
+            String::from_utf8_lossy(&top).contains("line 1"),
+            "bold kept"
+        );
+
+        let mut empty = vt100::Parser::new_with_callbacks(5, 20, 1000, ShellMarks::default());
+        empty.process(b"$ ");
+        let mut client = vt100::Parser::new_with_callbacks(5, 20, 1000, ShellMarks::default());
+        client.process(&Session::screen_with_history(&mut empty));
+        assert_eq!(history(&mut client).0, 0, "no history, no blank lines");
+    }
+
+    #[test]
     fn activity_accumulates_within_a_second() {
         let mut activity = Activity::default();
         activity.record(0, 10);
@@ -493,6 +552,44 @@ mod tests {
         assert_eq!(activity.values(), [0, 0, 0, 0, 0, 0, 0, 4]);
     }
 
+    /// Runs `line` (which exits with 3) in an integrated shell and checks chiika saw it;
+    /// returns the shell's directory as reported.
+    fn assert_integration_reports(cmd: CommandBuilder, line: &str) -> String {
+        let (mut session, _rx) = spawn(cmd);
+        let wait = |session: &Session, what: &str, done: &dyn Fn(&ShellMarks) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !session.marks(done) {
+                let screen = session.parser.lock().unwrap().screen().contents();
+                assert!(
+                    Instant::now() < deadline,
+                    "timeout waiting for {what}, screen:\n{screen}"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+        wait(&session, "first prompt", &|m| {
+            m.integrated && m.cwd.is_some()
+        });
+        session.write(format!("{line}\r").as_bytes()).unwrap();
+        wait(&session, "command end", &|m| m.last.is_some());
+        let last = session.marks(|m| m.last.clone()).unwrap();
+        assert_eq!(last.text, line);
+        assert_eq!(last.code, 3);
+        assert_eq!(session.take_finished().len(), 1);
+        assert!(!session.is_busy(Instant::now()));
+        session.kill();
+        session.marks(|m| m.cwd.clone()).unwrap()
+    }
+
+    /// The bash or zsh `prog` with chiika's integration, its scripts in a fresh folder.
+    fn integrated(prog: &str, integration: crate::shell::Integration) -> CommandBuilder {
+        let dir = std::env::temp_dir().join(format!("chiika-{prog}-{}", std::process::id()));
+        let mut launch = crate::protocol::Launch::new(vec![prog.into()], dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        integration.apply(&mut launch, Some(&dir)).unwrap();
+        launch.to_command()
+    }
+
     #[cfg(windows)]
     #[test]
     fn powershell_integration_reports_commands_and_cwd() {
@@ -505,24 +602,40 @@ mod tests {
             "-EncodedCommand",
             &script,
         ]);
-        let (mut session, _rx) = spawn(cmd);
-        let wait = |session: &Session, what: &str, done: &dyn Fn(&ShellMarks) -> bool| {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while !session.marks(done) {
-                assert!(Instant::now() < deadline, "timeout waiting for {what}");
-                thread::sleep(Duration::from_millis(50));
-            }
-        };
-        wait(&session, "first prompt", &|m| {
-            m.integrated && m.cwd.is_some()
-        });
-        session.write(b"cmd /c exit 3\r").unwrap();
-        wait(&session, "command end", &|m| m.last.is_some());
-        let last = session.marks(|m| m.last.clone()).unwrap();
-        assert_eq!(last.text, "cmd /c exit 3");
-        assert_eq!(last.code, 3);
-        assert_eq!(session.take_finished().len(), 1);
-        assert!(!session.is_busy(Instant::now()));
-        session.kill();
+        assert_integration_reports(cmd, "cmd /c exit 3");
+    }
+
+    // Linux only: macOS ships bash 3.2, without the PS0 the command line needs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bash_integration_reports_commands_and_cwd() {
+        let cmd = integrated("bash", crate::shell::Integration::Bash);
+        assert_integration_reports(cmd, "echo a; (exit 3)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_integration_reports_commands_and_cwd() {
+        if std::process::Command::new("zsh")
+            .arg("-c")
+            .arg(":")
+            .status()
+            .is_err()
+        {
+            eprintln!("zsh not installed, skipped");
+            return;
+        }
+        let cmd = integrated("zsh", crate::shell::Integration::Zsh);
+        assert_integration_reports(cmd, "echo a; (exit 3)");
+    }
+
+    // Needs a WSL distribution with bash: `cargo test -- --ignored` on a machine that has one.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn wsl_integration_reports_commands_and_cwd() {
+        let cmd = integrated("wsl.exe", crate::shell::Integration::Wsl);
+        let cwd = assert_integration_reports(cmd, "echo a; (exit 3)");
+        assert!(std::path::Path::new(&cwd).is_dir(), "a Windows path: {cwd}");
     }
 }

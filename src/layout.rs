@@ -1,9 +1,10 @@
 //! Split layout of the main area: a binary tree of panes, each showing one session.
 
 use ratatui::layout::{Position, Rect};
+use serde::{Deserialize, Serialize};
 
 /// How a pane is cut in two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Split {
     /// Side by side.
     Right,
@@ -20,15 +21,43 @@ pub enum Dir {
     Down,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Layout {
     /// A pane showing the session with this id.
     Pane(u32),
     Split {
         dir: Split,
+        /// Part of the space given to `first`, in thousandths.
+        share: u16,
         first: Box<Layout>,
         second: Box<Layout>,
     },
+}
+
+/// The border between the two halves of a split, which the mouse can drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Divider {
+    /// The split, in the order of `dividers`.
+    pub index: usize,
+    pub dir: Split,
+    /// The split's whole area.
+    pub area: Rect,
+    pub share: u16,
+}
+
+/// A half never gets less than this, in thousandths.
+const MIN_SHARE: u16 = 150;
+
+impl Divider {
+    /// The share that puts the border under `pos`, kept between 15 % and 85 %.
+    pub fn share_at(&self, pos: Position) -> u16 {
+        let (offset, size) = match self.dir {
+            Split::Right => (pos.x.saturating_sub(self.area.x), self.area.width),
+            Split::Down => (pos.y.saturating_sub(self.area.y), self.area.height),
+        };
+        let share = u32::from(offset) * 1000 / u32::from(size.max(1));
+        (share as u16).clamp(MIN_SHARE, 1000 - MIN_SHARE)
+    }
 }
 
 impl Layout {
@@ -42,11 +71,84 @@ impl Layout {
     fn collect(&self, area: Rect, out: &mut Vec<(u32, Rect)>) {
         match self {
             Layout::Pane(id) => out.push((*id, area)),
-            Layout::Split { dir, first, second } => {
-                let (a, b) = halves(area, *dir);
+            Layout::Split {
+                dir,
+                share,
+                first,
+                second,
+            } => {
+                let (a, b) = halves(area, *dir, *share);
                 first.collect(a, out);
                 second.collect(b, out);
             }
+        }
+    }
+
+    /// Every split's border, parents before children.
+    pub fn dividers(&self, area: Rect) -> Vec<Divider> {
+        let mut out = Vec::new();
+        self.collect_dividers(area, &mut out);
+        out
+    }
+
+    fn collect_dividers(&self, area: Rect, out: &mut Vec<Divider>) {
+        if let Layout::Split {
+            dir,
+            share,
+            first,
+            second,
+        } = self
+        {
+            out.push(Divider {
+                index: out.len(),
+                dir: *dir,
+                area,
+                share: *share,
+            });
+            let (a, b) = halves(area, *dir, *share);
+            first.collect_dividers(a, out);
+            second.collect_dividers(b, out);
+        }
+    }
+
+    /// The border under `pos`: the two border columns (or rows) where two panes meet.
+    pub fn divider_at(&self, area: Rect, pos: Position) -> Option<Divider> {
+        // Children last: the innermost border wins where borders cross.
+        self.dividers(area).into_iter().rev().find(|d| {
+            let (first, _) = halves(d.area, d.dir, d.share);
+            match d.dir {
+                Split::Right => {
+                    (first.right().saturating_sub(1)..=first.right()).contains(&pos.x)
+                        && (d.area.top()..d.area.bottom()).contains(&pos.y)
+                }
+                Split::Down => {
+                    (first.bottom().saturating_sub(1)..=first.bottom()).contains(&pos.y)
+                        && (d.area.left()..d.area.right()).contains(&pos.x)
+                }
+            }
+        })
+    }
+
+    /// Sets the share of the `index`-th split (see `dividers`).
+    pub fn set_share(&mut self, index: usize, value: u16) {
+        self.set_share_from(&mut 0, index, value);
+    }
+
+    fn set_share_from(&mut self, seen: &mut usize, index: usize, value: u16) {
+        if let Layout::Split {
+            share,
+            first,
+            second,
+            ..
+        } = self
+        {
+            if *seen == index {
+                *share = value;
+                return;
+            }
+            *seen += 1;
+            first.set_share_from(seen, index, value);
+            second.set_share_from(seen, index, value);
         }
     }
 
@@ -68,6 +170,7 @@ impl Layout {
             Layout::Pane(id) if *id == target => {
                 *self = Layout::Split {
                     dir,
+                    share: 500,
                     first: Box::new(Layout::Pane(target)),
                     second: Box::new(Layout::Pane(new)),
                 };
@@ -111,6 +214,27 @@ impl Layout {
         true
     }
 
+    /// The layout without the panes whose session `keep` refuses; `None` if none is left.
+    pub fn pruned(self, keep: &impl Fn(u32) -> bool) -> Option<Layout> {
+        match self {
+            Layout::Pane(id) => keep(id).then_some(self),
+            Layout::Split {
+                dir,
+                share,
+                first,
+                second,
+            } => match (first.pruned(keep), second.pruned(keep)) {
+                (Some(first), Some(second)) => Some(Layout::Split {
+                    dir,
+                    share,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (one, other) => one.or(other),
+            },
+        }
+    }
+
     /// Closest pane in direction `dir` from the pane of `from`, among those facing it.
     pub fn neighbor(&self, area: Rect, from: u32, dir: Dir) -> Option<u32> {
         let rects = self.rects(area);
@@ -140,10 +264,11 @@ impl Layout {
     }
 }
 
-fn halves(area: Rect, dir: Split) -> (Rect, Rect) {
+fn halves(area: Rect, dir: Split, share: u16) -> (Rect, Rect) {
+    let part = |size: u16| (u32::from(size) * u32::from(share) / 1000) as u16;
     match dir {
         Split::Right => {
-            let w = area.width / 2;
+            let w = part(area.width);
             (
                 Rect { width: w, ..area },
                 Rect {
@@ -154,7 +279,7 @@ fn halves(area: Rect, dir: Split) -> (Rect, Rect) {
             )
         }
         Split::Down => {
-            let h = area.height / 2;
+            let h = part(area.height);
             (
                 Rect { height: h, ..area },
                 Rect {
@@ -177,6 +302,16 @@ mod tests {
         assert!(layout.split(1, 2, Split::Right));
         assert!(layout.split(2, 3, Split::Down));
         layout
+    }
+
+    #[test]
+    fn panes_of_gone_sessions_are_pruned() {
+        let layout = three_panes();
+        let pruned = layout.clone().pruned(&|id| id != 2).unwrap();
+        assert_eq!(pruned.panes(), [1, 3]);
+        assert_eq!(layout.clone().pruned(&|id| id == 1), Some(Layout::Pane(1)));
+        assert_eq!(layout.clone().pruned(&|_| false), None);
+        assert_eq!(layout.clone().pruned(&|_| true), Some(layout));
     }
 
     #[test]
@@ -232,6 +367,29 @@ mod tests {
         let mut layout = Layout::Pane(1);
         assert!(!layout.remove(1));
         assert!(!three_panes().remove(42));
+    }
+
+    #[test]
+    fn borders_are_found_and_dragged() {
+        let mut layout = three_panes();
+        let area = Rect::new(0, 0, 100, 40);
+        // 1 | (2 over 3): the vertical border at x 49-50, the horizontal one at y 19-20.
+        let outer = layout.divider_at(area, Position::new(50, 5)).unwrap();
+        assert_eq!((outer.index, outer.dir), (0, Split::Right));
+        let inner = layout.divider_at(area, Position::new(70, 19)).unwrap();
+        assert_eq!((inner.index, inner.dir), (1, Split::Down));
+        assert_eq!(
+            layout.divider_at(area, Position::new(20, 20)),
+            None,
+            "inside pane 1"
+        );
+
+        layout.set_share(0, outer.share_at(Position::new(30, 5)));
+        assert_eq!(layout.rects(area)[0].1.width, 30);
+        layout.set_share(1, 250);
+        assert_eq!(layout.rects(area)[1].1.height, 10);
+        assert_eq!(outer.share_at(Position::new(0, 5)), 150, "at least 15 %");
+        assert_eq!(outer.share_at(Position::new(99, 5)), 850, "at most 85 %");
     }
 
     #[test]

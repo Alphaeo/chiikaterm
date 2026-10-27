@@ -1,12 +1,111 @@
-//! Shell integration: the PowerShell script chiika injects, and the OSC marks it emits
-//! (`133;A/B/C/D` prompt and command boundaries, `633;E` command line, `9;9` current directory).
+//! Shell integration: the scripts chiika injects (PowerShell, bash, zsh), and the OSC marks they
+//! emit (`133;A/B/C/D` prompt and command boundaries, `633;E` command line, `9;9` current
+//! directory).
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{FinishedSnapshot, MarksSnapshot};
+use crate::protocol::{FinishedSnapshot, Launch, MarksSnapshot};
 
 /// Script run by chiika's PowerShell sessions, see `encoded_command`.
 const SCRIPT: &str = include_str!("shell_integration.ps1");
+const BASH_SCRIPT: &str = include_str!("shell_integration.bash");
+const ZSH_ENV: &str = include_str!("shell_integration.zshenv");
+const ZSH_RC: &str = include_str!("shell_integration.zsh");
+
+/// A shell chiika can integrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Integration {
+    PowerShell,
+    Bash,
+    /// bash in WSL's default distribution, started by `wsl.exe`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Wsl,
+    Zsh,
+}
+
+impl Integration {
+    /// The integration of a shell program (`/bin/zsh`, `bash`…).
+    pub fn of_prog(prog: &str) -> Option<Integration> {
+        let name = Path::new(prog).file_stem()?.to_str()?;
+        match name {
+            "pwsh" | "powershell" => Some(Integration::PowerShell),
+            "bash" => Some(Integration::Bash),
+            "zsh" => Some(Integration::Zsh),
+            _ => None,
+        }
+    }
+
+    /// Adds to `launch` (the shell's program and arguments) what loads the integration. bash
+    /// and zsh read scripts that are written to `dir` (the project's `.chiika/shell`): without
+    /// it, nothing is added.
+    pub fn apply(self, launch: &mut Launch, dir: Option<&Path>) -> std::io::Result<()> {
+        let script = |dir: &Path, name: &str, text: &str| -> std::io::Result<std::path::PathBuf> {
+            std::fs::create_dir_all(dir)?;
+            let path = dir.join(name);
+            std::fs::write(&path, text)?;
+            Ok(path)
+        };
+        match (self, dir) {
+            (Integration::PowerShell, _) => {
+                // After the user's profile: wraps their prompt, survives their settings.
+                launch.argv.extend([
+                    "-NoExit".into(),
+                    "-EncodedCommand".into(),
+                    encoded_command(),
+                ]);
+            }
+            (_, None) => {}
+            (Integration::Bash, Some(dir)) => {
+                let rc = script(dir, "chiika.bash", BASH_SCRIPT)?;
+                let rc = rc.to_string_lossy().into_owned();
+                launch.argv.extend(["--rcfile".into(), rc, "-i".into()]);
+            }
+            (Integration::Wsl, Some(dir)) => {
+                let rc = script(dir, "chiika.bash", BASH_SCRIPT)?;
+                // A path WSL cannot see (network share): a plain WSL shell.
+                if let Some(rc) = wsl_path(&rc) {
+                    launch
+                        .argv
+                        .extend(["-e", "bash", "--rcfile", &rc, "-i"].map(String::from));
+                    // Tells the script it runs for wsl.exe; WSLENV carries it into Linux.
+                    let wslenv = match std::env::var("WSLENV") {
+                        Ok(list) if !list.is_empty() => format!("{list}:CHIIKA_WSL"),
+                        _ => "CHIIKA_WSL".into(),
+                    };
+                    launch.env.push(("CHIIKA_WSL".into(), "1".into()));
+                    launch.env.push(("WSLENV".into(), wslenv));
+                }
+            }
+            (Integration::Zsh, Some(dir)) => {
+                let zdotdir = dir.join("zsh");
+                script(&zdotdir, ".zshenv", ZSH_ENV)?;
+                script(&zdotdir, ".zshrc", ZSH_RC)?;
+                if let Ok(user) = std::env::var("ZDOTDIR") {
+                    launch.env.push(("CHIIKA_USER_ZDOTDIR".into(), user));
+                }
+                launch
+                    .env
+                    .push(("ZDOTDIR".into(), zdotdir.to_string_lossy().into_owned()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `C:\Users\me` as WSL mounts it by default, `/mnt/c/Users/me`; `None` for other paths.
+fn wsl_path(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let mut chars = path.chars();
+    let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+    let rest = chars.as_str().strip_prefix(':')?;
+    Some(format!(
+        "/mnt/{}{}",
+        drive.to_ascii_lowercase(),
+        rest.replace('\\', "/")
+    ))
+}
 
 /// Argument of `-EncodedCommand`: the script as base64 of its UTF-16LE bytes.
 pub fn encoded_command() -> String {
@@ -62,7 +161,12 @@ pub struct ShellMarks {
     finished: Vec<Finished>,
     /// Command line announced by `633;E`, waiting for `133;C`.
     pending: Option<String>,
+    /// Text of the recent prompts (their line up to `133;B`), to find them in the history.
+    pub prompts: Vec<String>,
 }
+
+/// Distinct prompts remembered for `find_prompt`.
+const PROMPTS_KEPT: usize = 20;
 
 impl ShellMarks {
     pub fn take_finished(&mut self) -> Vec<Finished> {
@@ -75,6 +179,7 @@ impl ShellMarks {
         MarksSnapshot {
             integrated: self.integrated,
             cwd: self.cwd.clone(),
+            prompts: self.prompts.clone(),
             running: self
                 .running
                 .as_ref()
@@ -105,7 +210,22 @@ impl ShellMarks {
             }),
             finished: Vec::new(),
             pending: None,
+            prompts: snapshot.prompts.clone(),
         }
+    }
+
+    /// Remembers the prompt that just ended at the cursor (`133;B`).
+    fn remember_prompt(&mut self, screen: &vt100::Screen) {
+        let (row, col) = screen.cursor_position();
+        let prompt = screen.contents_between(row, 0, row, col);
+        // Kept with its trailing space ("$ "): a line of output starting with "$" is no prompt.
+        if prompt.trim().is_empty() {
+            return;
+        }
+        self.prompts.retain(|p| *p != prompt);
+        self.prompts.push(prompt);
+        let excess = self.prompts.len().saturating_sub(PROMPTS_KEPT);
+        self.prompts.drain(..excess);
     }
 
     fn on_osc(&mut self, params: &[&[u8]], now: Instant) {
@@ -153,9 +273,40 @@ impl ShellMarks {
 }
 
 impl vt100::Callbacks for ShellMarks {
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
+        if let [b"133", b"B", ..] = params {
+            self.remember_prompt(screen);
+        }
         self.on_osc(params, Instant::now());
     }
+}
+
+/// Scrolls the view to the previous (`up`) or next prompt of the history: the nearest offset
+/// whose top line starts with a remembered prompt. Down past the last one: the live screen.
+/// Returns whether the view moved.
+pub fn jump_prompt(parser: &mut vt100::Parser<ShellMarks>, up: bool) -> bool {
+    let prompts = parser.callbacks().prompts.clone();
+    if prompts.is_empty() {
+        return false;
+    }
+    let screen = parser.screen_mut();
+    let current = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let max = screen.scrollback();
+    let cols = screen.size().1;
+    let mut is_prompt = |offset: usize| {
+        screen.set_scrollback(offset);
+        let top = screen.rows(0, cols).next().unwrap_or_default();
+        prompts.iter().any(|p| top.starts_with(p.as_str()))
+    };
+    let found = if up {
+        (current + 1..=max).find(|&o| is_prompt(o))
+    } else {
+        (1..current).rev().find(|&o| is_prompt(o)).or(Some(0))
+    };
+    let target = found.unwrap_or(current);
+    parser.screen_mut().set_scrollback(target);
+    target != current
 }
 
 /// Undoes the script's escaping: `\\` and `\xHH`.
@@ -268,6 +419,76 @@ mod tests {
         let last = restored.last.clone().unwrap();
         assert_eq!((last.text.as_str(), last.code), ("cargo test", 101));
         assert_eq!(restored.snapshot(now), snapshot);
+    }
+
+    #[test]
+    fn jumps_go_from_prompt_to_prompt() {
+        // Three prompts, each followed by 10 lines, on a 5-row screen.
+        let mut parser = vt100::Parser::new_with_callbacks(5, 20, 100, ShellMarks::default());
+        for command in 0..3 {
+            parser.process(format!("$ \x1b]133;B\x07cmd{command}\r\n").as_bytes());
+            for line in 0..10 {
+                parser.process(format!("out{command}-{line}\r\n").as_bytes());
+            }
+        }
+        assert_eq!(parser.callbacks().prompts, ["$ "]);
+        let top = |p: &vt100::Parser<ShellMarks>| p.screen().rows(0, 20).next().unwrap();
+        assert!(jump_prompt(&mut parser, true));
+        assert_eq!(top(&parser), "$ cmd2");
+        assert!(jump_prompt(&mut parser, true));
+        assert_eq!(top(&parser), "$ cmd1");
+        assert!(jump_prompt(&mut parser, false));
+        assert_eq!(top(&parser), "$ cmd2");
+        assert!(jump_prompt(&mut parser, false));
+        assert_eq!(parser.screen().scrollback(), 0, "back to the live screen");
+        assert!(!jump_prompt(&mut parser, false));
+    }
+
+    #[test]
+    fn shells_are_recognised_by_program() {
+        assert_eq!(Integration::of_prog("/bin/zsh"), Some(Integration::Zsh));
+        assert_eq!(
+            Integration::of_prog("/usr/local/bin/bash"),
+            Some(Integration::Bash)
+        );
+        assert_eq!(
+            Integration::of_prog("pwsh.exe"),
+            Some(Integration::PowerShell)
+        );
+        assert_eq!(Integration::of_prog("/usr/bin/fish"), None);
+    }
+
+    #[test]
+    fn windows_paths_become_wsl_paths() {
+        assert_eq!(
+            wsl_path(Path::new(r"C:\Users\me\.chiika\shell\chiika.bash")).as_deref(),
+            Some("/mnt/c/Users/me/.chiika/shell/chiika.bash")
+        );
+        assert_eq!(
+            wsl_path(Path::new(r"\\?\D:\p")).as_deref(),
+            Some("/mnt/d/p")
+        );
+        assert_eq!(wsl_path(Path::new(r"\\server\share\p")), None);
+        assert_eq!(wsl_path(Path::new("/home/me")), None);
+    }
+
+    #[test]
+    fn bash_and_zsh_need_a_folder_for_their_scripts() {
+        let dir = std::env::temp_dir().join(format!("chiika-shell-{}", std::process::id()));
+        let mut launch = Launch::new(vec!["bash".into()], dir.clone());
+        Integration::Bash.apply(&mut launch, None).unwrap();
+        assert_eq!(launch.argv, ["bash"], "no project: a plain shell");
+
+        Integration::Bash.apply(&mut launch, Some(&dir)).unwrap();
+        assert_eq!(launch.argv[1], "--rcfile");
+        let rc = std::fs::read_to_string(&launch.argv[2]).unwrap();
+        assert_eq!(rc, BASH_SCRIPT);
+
+        let mut launch = Launch::new(vec!["zsh".into()], dir.clone());
+        Integration::Zsh.apply(&mut launch, Some(&dir)).unwrap();
+        let (_, zdotdir) = launch.env.iter().find(|(k, _)| k == "ZDOTDIR").unwrap();
+        assert!(Path::new(zdotdir).join(".zshrc").is_file());
+        assert!(Path::new(zdotdir).join(".zshenv").is_file());
     }
 
     #[test]

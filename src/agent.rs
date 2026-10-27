@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 
 use crate::channel::HookEvent;
+use crate::config::AgentEntry;
+use crate::policy::Rules;
 use crate::protocol::AgentSnapshot;
 
 /// Roles offered when adding an agent, with the duty added to its system prompt.
@@ -85,6 +87,13 @@ pub struct AgentInfo {
     pub files: Vec<String>,
     /// Since when chiika holds its permission request, waiting for the user's answer.
     pub permission: Option<Instant>,
+    /// Claude Code's conversation id, to resume it (`None` for agents of older chiika builds).
+    pub conversation: Option<String>,
+    /// Its role and its team's name when it started, for the audit log.
+    pub role: String,
+    pub team_name: String,
+    /// Permission rules the project's policy gave it.
+    pub rules: usize,
 }
 
 impl AgentInfo {
@@ -99,6 +108,10 @@ impl AgentInfo {
             message: None,
             files: Vec::new(),
             permission: None,
+            conversation: None,
+            role: String::new(),
+            team_name: String::new(),
+            rules: 0,
         }
     }
 
@@ -116,6 +129,10 @@ impl AgentInfo {
             permission_ms: self
                 .permission
                 .map(|t| now.saturating_duration_since(t).as_millis() as u64),
+            conversation: self.conversation.clone(),
+            role: self.role.clone(),
+            team_name: self.team_name.clone(),
+            rules: self.rules,
         }
     }
 
@@ -133,6 +150,10 @@ impl AgentInfo {
             permission: snapshot
                 .permission_ms
                 .and_then(|ms| now.checked_sub(Duration::from_millis(ms))),
+            conversation: snapshot.conversation.clone(),
+            role: snapshot.role.clone(),
+            team_name: snapshot.team_name.clone(),
+            rules: snapshot.rules,
         }
     }
 
@@ -240,18 +261,14 @@ fn edited_file(event: &HookEvent) -> Option<String> {
     }
 }
 
-/// Text added to the agent's system prompt.
+/// Text added to the agent's system prompt; `duty` is what its role does (`Policy::duty`).
 pub fn system_prompt(
-    role: &str,
+    duty: &str,
     team: &str,
     instructions: &str,
     folder: &Path,
     worktree: Option<&str>,
 ) -> String {
-    let duty = ROLES
-        .iter()
-        .find(|(name, _)| *name == role)
-        .map_or("", |(_, duty)| duty);
     let place = match worktree {
         Some(name) => format!(
             "You work in your own git worktree \"{name}\", created for this session: commit your \
@@ -301,8 +318,9 @@ pub fn mcp_config(exe: &Path, port: u16, token: &str, session: u32) -> String {
     .to_string()
 }
 
-/// Claude Code settings that run `<exe> hook` on every hook chiika listens to.
-pub fn hook_settings(exe: &Path) -> String {
+/// Claude Code settings that run `<exe> hook` on every hook chiika listens to, with the
+/// permission `rules` of the project's policy.
+pub fn hook_settings(exe: &Path, rules: &Rules) -> String {
     // Claude runs hook commands with a POSIX shell (Git Bash on Windows): forward slashes.
     let command = format!("\"{}\" hook", exe.display().to_string().replace('\\', "/"));
     let hooks: serde_json::Map<String, serde_json::Value> = HOOKS
@@ -320,12 +338,50 @@ pub fn hook_settings(exe: &Path) -> String {
             (name.to_string(), entry)
         })
         .collect();
+    // The chiika tools never ask for permission.
+    let allow: Vec<&str> = std::iter::once("mcp__chiika")
+        .chain(rules.allow.iter().map(String::as_str))
+        .collect();
     serde_json::json!({
         "hooks": hooks,
-        // The chiika tools never ask for permission.
-        "permissions": { "allow": ["mcp__chiika"] },
+        "permissions": { "allow": allow, "ask": rules.ask, "deny": rules.deny },
     })
     .to_string()
+}
+
+/// Claude's arguments for the conversation of `entry`: a new one, in the worktree Claude creates,
+/// or the resumption of the saved one (started in the worktree, which then exists).
+pub fn conversation_args(entry: &AgentEntry, resume: bool) -> Vec<String> {
+    if resume {
+        return vec!["--resume".into(), entry.conversation.clone()];
+    }
+    let mut args = vec!["--session-id".into(), entry.conversation.clone()];
+    if let Some(name) = &entry.worktree {
+        args.extend(["--worktree".into(), name.clone()]);
+    }
+    args
+}
+
+/// Where Claude puts the worktree `name` of the project at `root`.
+pub fn worktree_folder(root: &Path, name: &str) -> PathBuf {
+    root.join(".claude").join("worktrees").join(name)
+}
+
+/// A random UUID v4, for Claude Code's `--session-id`.
+pub fn new_conversation_id() -> String {
+    let mut hex: Vec<char> = crate::channel::random_token().chars().collect();
+    hex[12] = '4';
+    // Variant 10xx: 8, 9, a or b.
+    hex[16] = ['8', '9', 'a', 'b'][hex[16].to_digit(16).unwrap_or(0) as usize % 4];
+    let part = |range: std::ops::Range<usize>| hex[range].iter().collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        part(0..8),
+        part(8..12),
+        part(12..16),
+        part(16..20),
+        part(20..32)
+    )
 }
 
 /// Claude Code's executable. The npm install has `claude.cmd` next to `node_modules` holding the
@@ -384,7 +440,14 @@ pub fn free_worktree_name(root: &Path, base: &str, n: u32) -> String {
 
 /// `.chiika/.gitignore` keeping the agents' files out of the project's git status.
 pub fn ensure_gitignore(data_dir: &Path) -> std::io::Result<()> {
-    const IGNORED: [&str; 3] = ["agents/", "bin/", "daemon.toml"];
+    const IGNORED: [&str; 6] = [
+        "agents/",
+        "audit/",
+        "bin/",
+        "daemon.toml",
+        "layout.toml",
+        "agents.toml",
+    ];
     let path = data_dir.join(".gitignore");
     let mut text = std::fs::read_to_string(&path).unwrap_or_default();
     let missing: Vec<&str> = IGNORED
@@ -526,9 +589,49 @@ mod tests {
     }
 
     #[test]
+    fn new_agents_name_their_conversation_and_resumed_ones_reopen_it() {
+        let entry = AgentEntry {
+            team: 1,
+            role: "coder".into(),
+            folder: worktree_folder(Path::new("/p"), "api-coder-3"),
+            worktree: Some("api-coder-3".into()),
+            conversation: "c0ffee".into(),
+        };
+        assert_eq!(
+            conversation_args(&entry, false),
+            ["--session-id", "c0ffee", "--worktree", "api-coder-3"]
+        );
+        assert_eq!(conversation_args(&entry, true), ["--resume", "c0ffee"]);
+        assert_eq!(entry.folder, Path::new("/p/.claude/worktrees/api-coder-3"));
+        let in_project = AgentEntry {
+            worktree: None,
+            ..entry
+        };
+        assert_eq!(
+            conversation_args(&in_project, false),
+            ["--session-id", "c0ffee"]
+        );
+    }
+
+    #[test]
+    fn conversation_ids_are_uuid_v4() {
+        let id = new_conversation_id();
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+        assert!(parts[2].starts_with('4'));
+        assert!(parts[3].starts_with(['8', '9', 'a', 'b']));
+        assert_ne!(new_conversation_id(), id);
+    }
+
+    #[test]
     fn agents_survive_a_snapshot() {
         let now = Instant::now();
         let mut a = agent(now);
+        a.conversation = Some(new_conversation_id());
         a.state = AgentState::Waiting;
         a.tool = Some("✎ api.rs".into());
         a.files = vec!["api.rs".into()];
@@ -547,7 +650,10 @@ mod tests {
         ensure_gitignore(&dir).unwrap();
         ensure_gitignore(&dir).unwrap();
         let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
-        assert_eq!(text, "agents/\nmine\nbin/\ndaemon.toml\n");
+        assert_eq!(
+            text,
+            "agents/\nmine\naudit/\nbin/\ndaemon.toml\nlayout.toml\nagents.toml\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -568,7 +674,7 @@ mod tests {
     #[test]
     fn prompt_has_role_team_instructions_and_place() {
         let prompt = system_prompt(
-            "reviewer",
+            ROLES[2].1,
             "backend",
             "# backend\nRust API.\n",
             Path::new("/w"),
@@ -578,7 +684,7 @@ mod tests {
         assert!(prompt.contains("You are the reviewer"));
         assert!(prompt.contains("Rust API."));
         assert!(prompt.contains("worktree \"backend-reviewer-3\""));
-        let here = system_prompt("coder", "t", "", Path::new("/p"), None);
+        let here = system_prompt("", "t", "", Path::new("/p"), None);
         assert!(here.contains("project folder"));
     }
 
@@ -596,13 +702,26 @@ mod tests {
 
     #[test]
     fn settings_run_chiika_hook_for_every_event() {
-        let settings = hook_settings(Path::new("C:\\bin\\chiika.exe"));
+        let rules = Rules {
+            allow: vec!["Bash(cargo test:*)".into()],
+            ask: vec![],
+            deny: vec!["Read(./.env)".into()],
+        };
+        let settings = hook_settings(Path::new("C:\\bin\\chiika.exe"), &rules);
         let value: serde_json::Value = serde_json::from_str(&settings).unwrap();
         for name in HOOKS {
             let command = &value["hooks"][name][0]["hooks"][0]["command"];
             assert_eq!(command, "\"C:/bin/chiika.exe\" hook");
         }
-        assert_eq!(value["permissions"]["allow"][0], "mcp__chiika");
+        assert_eq!(
+            value["permissions"]["allow"],
+            serde_json::json!(["mcp__chiika", "Bash(cargo test:*)"])
+        );
+        assert_eq!(
+            value["permissions"]["deny"],
+            serde_json::json!(["Read(./.env)"])
+        );
+        assert_eq!(value["permissions"]["ask"], serde_json::json!([]));
         let permission = &value["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"];
         assert!(permission.as_u64().unwrap() > PERMISSION_WAIT.as_secs());
     }

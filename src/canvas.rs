@@ -941,6 +941,12 @@ fn draw_inspector(
         .collect();
     line(&format!("folder  {tail}"), muted);
     line(&format!("files   {}", agent.files.join(", ")), muted);
+    let policy = match agent.rules {
+        0 => "no rules".to_string(),
+        1 => "1 rule".to_string(),
+        n => format!("{n} rules"),
+    };
+    line(&format!("policy  {policy}"), muted);
     line("", Style::new());
     let message = agent.shown_message(now).unwrap_or_default();
     for text in wrap(&message, width, 3) {
