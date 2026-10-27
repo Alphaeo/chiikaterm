@@ -37,6 +37,26 @@ them while you watch.
 chiika is developed and tested on **Windows 10/11** with Windows Terminal. Linux and macOS
 builds compile in CI but are not tested by hand yet.
 
+### From a release
+
+No Rust needed. In PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Alphaeo/chiikaterm/releases/latest/download/chiika-installer.ps1 | iex"
+```
+
+On Linux and macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Alphaeo/chiikaterm/releases/latest/download/chiika-installer.sh | sh
+```
+
+Windows also has an `.msi` on the [releases page](https://github.com/Alphaeo/chiikaterm/releases),
+with the archives for each system and their SHA-256. The binaries are not signed yet: Windows
+SmartScreen asks to confirm the first run (*More info › Run anyway*).
+
+Then [run it](#3-run-it). To build it yourself instead:
+
 ### 1. Prerequisites
 
 - **Rust** (1.88 or later):

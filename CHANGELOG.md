@@ -6,7 +6,10 @@ Notable changes to chiika, newest first. The format follows
 
 ## [Unreleased]
 
-First public version (0.1.0).
+## [0.1.0] - 2026-10-27
+
+First public version. The binaries are not signed yet: Windows SmartScreen and macOS Gatekeeper
+warn before the first run.
 
 ### Added
 
@@ -23,3 +26,6 @@ First public version (0.1.0).
 - Governance: a project policy (`.chiika/policy.toml`) giving agents permission rules per project,
   team and role, and an audit log of what agents did (`.chiika/audit/`).
 - `chiika --version` names the commit it was built from.
+
+[Unreleased]: https://github.com/Alphaeo/chiikaterm/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Alphaeo/chiikaterm/releases/tag/v0.1.0
